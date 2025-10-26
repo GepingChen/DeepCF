@@ -185,7 +185,20 @@ def simulate_dataset(cfg: DGPConfig) -> Dict[str, np.ndarray]:
 # =========================================================
 # Training and Test Data Generation Functions
 # =========================================================
-def training_data_generation(cfg: DGPConfig, save_csv: bool = True) -> Dict[str, np.ndarray]:
+def _resolve_path(path_like: str | os.PathLike[str]) -> Path:
+    """Resolve paths relative to the project root (folder containing this file)."""
+    path = Path(path_like)
+    if path.is_absolute():
+        return path
+    project_root = Path(__file__).resolve().parent
+    return project_root / path
+
+
+def training_data_generation(
+    cfg: DGPConfig,
+    save_csv: bool = True,
+    train_dir: str | os.PathLike[str] = "IV_datasets/train",
+) -> Dict[str, np.ndarray]:
     """
     Generate training data dynamically for each run.
     
@@ -203,10 +216,10 @@ def training_data_generation(cfg: DGPConfig, save_csv: bool = True) -> Dict[str,
     data = simulate_dataset(cfg)
     
     if save_csv:
-        # Create training data directory
-        train_dir = "/lustre/hdd/LAS/zhuz-lab/gepingc/TabPFN/IV_datasets/train"
+        # Create training data directory (resolved relative to repo root by default)
+        train_dir = _resolve_path(train_dir)
         os.makedirs(train_dir, exist_ok=True)
-        
+
         # Create DataFrame and save as CSV
         df = pd.DataFrame({
             'Z': data['Z'],
@@ -218,7 +231,7 @@ def training_data_generation(cfg: DGPConfig, save_csv: bool = True) -> Dict[str,
         })
         
         # Save with DGP configuration
-        csv_file = os.path.join(train_dir, f"train_data_{cfg.first_stage}_{cfg.second_stage}.csv")
+        csv_file = train_dir / f"train_data_{cfg.first_stage}_{cfg.second_stage}.csv"
         df.to_csv(csv_file, index=False)
         print(f"  ✅ Training data saved to: {csv_file}")
     
@@ -226,8 +239,12 @@ def training_data_generation(cfg: DGPConfig, save_csv: bool = True) -> Dict[str,
     return data
 
 
-def testdata_generation(cfg: DGPConfig, test_dir: str = "/lustre/hdd/LAS/zhuz-lab/gepingc/TabPFN/IV_datasets/test", 
-                       test_seed: int = 999, force_regenerate: bool = False) -> Dict[str, np.ndarray]:
+def testdata_generation(
+    cfg: DGPConfig,
+    test_dir: str | os.PathLike[str] = "IV_datasets/test",
+    test_seed: int = 999,
+    force_regenerate: bool = False,
+) -> Dict[str, np.ndarray]:
     """
     Generate or load fixed test dataset.
     
@@ -244,11 +261,12 @@ def testdata_generation(cfg: DGPConfig, test_dir: str = "/lustre/hdd/LAS/zhuz-la
         Dictionary with test data arrays (Z, X, Y, V_true, eps, eta)
     """
     # Create test directory if it doesn't exist
+    test_dir = _resolve_path(test_dir)
     os.makedirs(test_dir, exist_ok=True)
-    
+
     # Test data file path (CSV format)
-    test_data_file = os.path.join(test_dir, f"test_data_{cfg.first_stage}_{cfg.second_stage}.csv")
-    
+    test_data_file = test_dir / f"test_data_{cfg.first_stage}_{cfg.second_stage}.csv"
+
     # Check if test data already exists
     if os.path.exists(test_data_file) and not force_regenerate:
         print(f"Loading existing test data from: {test_data_file}")
@@ -416,4 +434,3 @@ if __name__ == "__main__":
     print("="*60)
     print("DGP CSV Generation Completed Successfully!")
     print("="*60)
-
