@@ -405,28 +405,26 @@ if __name__ == "__main__":
     print()
     
     # Verify files were created
-    train_dir = "/lustre/hdd/LAS/zhuz-lab/gepingc/TabPFN/IV_datasets/train"
-    test_dir = "/lustre/hdd/LAS/zhuz-lab/gepingc/TabPFN/IV_datasets/test"
+    train_dir = _resolve_path("IV_datasets/train")
+    test_dir = _resolve_path("IV_datasets/test")
     
     print("Verifying generated files...")
     
-    if os.path.exists(train_dir):
-        train_files = [f for f in os.listdir(train_dir) if f.endswith('.csv')]
+    if train_dir.exists():
+        train_files = [f for f in train_dir.glob("*.csv")]
         print(f"  Training CSV files: {len(train_files)}")
         for f in train_files:
-            file_path = os.path.join(train_dir, f)
-            size = os.path.getsize(file_path)
-            print(f"    {f}: {size:,} bytes")
+            size = f.stat().st_size
+            print(f"    {f.name}: {size:,} bytes")
     else:
         print("  ❌ Training directory not found")
-    
-    if os.path.exists(test_dir):
-        test_files = [f for f in os.listdir(test_dir) if f.endswith('.csv')]
+
+    if test_dir.exists():
+        test_files = [f for f in test_dir.glob("*.csv")]
         print(f"  Test CSV files: {len(test_files)}")
         for f in test_files:
-            file_path = os.path.join(test_dir, f)
-            size = os.path.getsize(file_path)
-            print(f"    {f}: {size:,} bytes")
+            size = f.stat().st_size
+            print(f"    {f.name}: {size:,} bytes")
     else:
         print("  ❌ Test directory not found")
     
