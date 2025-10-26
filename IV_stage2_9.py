@@ -38,7 +38,8 @@ V_EPSILON = 1e-6  # Avoid norm.ppf endpoints
 
 # --- TabPFN (with fallbacks) ---
 try:
-    from tabpfn import TabPFNRegressor
+    from tabpfn.regressor import TabPFNRegressor
+
     _HAVE_TABPFN = True
     print("✅ TabPFNRegressor imported successfully")
 except Exception as e:

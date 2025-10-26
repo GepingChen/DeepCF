@@ -34,7 +34,7 @@ import torch
 
 # --- TabPFN (required, no fallbacks) ---
 try:
-    from tabpfn import TabPFNRegressor
+    from tabpfn.regressor import TabPFNRegressor
     print("✅ TabPFNRegressor imported successfully")
 except Exception as e:
     raise ImportError(f"❌ TabPFN is required but not available: {e}")
