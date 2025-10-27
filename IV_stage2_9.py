@@ -268,7 +268,6 @@ def prepare_stage2_components(cfg: Stage2_9Config):
 
     m_model = FullDataStructuralFunctionModel(use_tabpfn=cfg.use_tabpfn)
     _ = m_model.fit_full(train_data["X"], train_data["V_hat"], train_data["Y"])
-    Y_test_pred = m_model.predict(test_data["X"], test_data["V_hat"])
 
     cdf_model = ConditionalCDFEstimator(use_tabpfn=cfg.use_tabpfn)
     _ = cdf_model.fit_full(train_data["X"], train_data["V_hat"], train_data["Y"])
@@ -288,7 +287,6 @@ def prepare_stage2_components(cfg: Stage2_9Config):
         "m_model": m_model,
         "cdf_model": cdf_model,
         "cdf_oracle": cdf_oracle,
-        "Y_test_pred": Y_test_pred
     }
 
 # =========================================================
@@ -894,6 +892,17 @@ def sample_tabpfn_y_given_x(cdf_model: ConditionalCDFEstimator,
     return y_samples, v_samples, u_samples
 
 
+def compute_y_clean(cfg: DGPConfig, x: np.ndarray) -> np.ndarray:
+    """Deterministic component of Y under the DGP (noise removed)."""
+    x_arr = np.asarray(x, dtype=float)
+    if cfg.second_stage == "B1":
+        return cfg.beta1 * x_arr + cfg.beta2 * (x_arr ** 2)
+    elif cfg.second_stage == "B2":
+        return np.sin(x_arr) + 0.5  # E[ε]=0, E[ε²]=1
+    else:
+        raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
+
+
 def compute_true_interventional_cdf(cfg: DGPConfig,
                                    x_grid: np.ndarray,
                                    y_grid: np.ndarray,
@@ -1042,8 +1051,6 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     m_model = components["m_model"]
     cdf_model = components["cdf_model"]
     cdf_oracle = components["cdf_oracle"]
-    Y_test_pred = components["Y_test_pred"]
-
     X_test = test_data["X"]
     Y_test = test_data["Y"]
     V_hat_test = test_data["V_hat"]
@@ -1071,12 +1078,11 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     Z_subset = None if test_data["Z"] is None else test_data["Z"][selected_idx]
     X_test_subset = X_test[selected_idx]
     Y_test_subset = Y_test[selected_idx]
+    Y_clean_subset = compute_y_clean(dgp_cfg, X_test_subset)
     V_hat_subset = V_hat_test[selected_idx]
     V_true_subset = V_true_test[selected_idx]
     eps_subset = None if test_data["eps"] is None else test_data["eps"][selected_idx]
     eta_subset = None if test_data["eta"] is None else test_data["eta"][selected_idx]
-    Y_test_pred_subset = Y_test_pred[selected_idx]
-
     print("\n[3/5] Integrating structural function for selected test observations...", flush=True)
     mu_c_test_estimated = compute_mu_c_on_grid(m_model, X_test_subset, cfg.n_v_integration_points)
     mu_c_test_oracle = None
@@ -1157,8 +1163,8 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     }
 
     # --- Metrics ---
-    mse_do_pred = float(np.mean((mu_c_test_estimated - Y_test_subset) ** 2))
-    metrics["mse_do_pred_vs_true"] = mse_do_pred
+    mse_do_pred = float(np.mean((mu_c_test_estimated - Y_clean_subset) ** 2))
+    metrics["mse_do_pred_vs_clean"] = mse_do_pred
 
     return {
         "config": asdict(cfg),
@@ -1191,7 +1197,7 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
             "Y_true": Y_test_subset,
             "Y_do_pred": mu_c_test_estimated,
             "Y_do_oracle": mu_c_test_oracle,
-            "Y_structural_pred": Y_test_pred_subset,
+            "Y_clean": Y_clean_subset,
             "V_hat": V_hat_subset,
             "V_true": V_true_subset,
             "eps": eps_subset,
@@ -1242,13 +1248,12 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
     pred_columns.extend([
         ("X", pred["X"]),
         ("Y_true", pred["Y_true"]),
+        ("Y_clean", pred["Y_clean"]),
         ("Y_do_pred", pred["Y_do_pred"]),
     ])
 
     if pred.get("Y_do_oracle") is not None:
         pred_columns.append(("Y_do_oracle", pred["Y_do_oracle"]))
-    if pred.get("Y_structural_pred") is not None:
-        pred_columns.append(("Y_structural_pred", pred["Y_structural_pred"]))
 
     for optional_key in ("V_hat", "V_true", "eps", "eta"):
         value = pred.get(optional_key)
@@ -1317,7 +1322,7 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
 
     metrics = results.get("metrics")
     if metrics:
-        summary_rows.append({"key": "metric_mse_do_pred_vs_true", "value": f"{metrics['mse_do_pred_vs_true']:.6f}"})
+        summary_rows.append({"key": "metric_mse_do_pred_vs_clean", "value": f"{metrics['mse_do_pred_vs_clean']:.6f}"})
         summary_rows.append({"key": "metric_iae_mean", "value": f"{metrics['iae_mean']:.6f}"})
         summary_rows.append({"key": "metric_iae_max", "value": f"{metrics['iae_max']:.6f}"})
         iae_series = ";".join(f"{val:.6f}" for val in metrics['iae_per_x'])
