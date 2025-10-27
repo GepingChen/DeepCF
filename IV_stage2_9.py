@@ -25,14 +25,14 @@ import numpy as np
 import pandas as pd
 from dataclasses import dataclass, asdict
 from typing import Dict, Tuple, Optional
-from scipy.stats import norm
+from scipy.stats import norm, gaussian_kde
 from scipy.integrate import simpson
 import os
 from datetime import datetime
 import torch
 
 # Import from Stage 1
-from DGP import DGPConfig, set_seed
+from DGP import DGPConfig, set_seed, sigmaY_of_X
 
 V_EPSILON = 1e-6  # Avoid norm.ppf endpoints
 
@@ -70,9 +70,9 @@ def m_true(cfg: DGPConfig, x: np.ndarray, v: np.ndarray) -> np.ndarray:
     t = norm.ppf(v)  # Φ^{-1}(v)
 
     if cfg.second_stage == "B1":
-        # m(x,v) = β1 x + β2 x^2 + σ_Y(v) * E[ε | V=v]
+        # m(x,v) = β1 x + β2 x^2 + σ_Y(x) * E[ε | V=v]
         e_mean = cfg.rho * t
-        sigY = np.exp(cfg.delta0 + cfg.delta1 * v)
+        sigY = sigmaY_of_X(x, cfg)
         return cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigY * e_mean
 
     elif cfg.second_stage == "B2":
@@ -743,9 +743,10 @@ def F_true_conditional_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.nd
     y = np.asarray(y)
     t = norm.ppf(v)
     e_mean = cfg.rho * t
-    sigY = np.exp(cfg.delta0 + cfg.delta1 * v)
+    sigY = sigmaY_of_X(x, cfg)
+    sigma_eps = np.sqrt(max(1.0 - cfg.rho ** 2, 1e-12))
     mu_cond = cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigY * e_mean
-    sigma_cond = sigY
+    sigma_cond = sigY * sigma_eps
     return norm.cdf(y, loc=mu_cond, scale=sigma_cond)
 
 
@@ -778,9 +779,10 @@ def f_true_density_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarra
     y = np.asarray(y)
     t = norm.ppf(v)
     e_mean = cfg.rho * t
-    sigma_y = np.exp(cfg.delta0 + cfg.delta1 * v)
+    sigma_y = sigmaY_of_X(x, cfg)
+    sigma_eps = np.sqrt(max(1.0 - cfg.rho ** 2, 1e-12))
     mu_cond = cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigma_y * e_mean
-    sigma_cond = sigma_y
+    sigma_cond = sigma_y * sigma_eps
     return norm.pdf(y, loc=mu_cond, scale=sigma_cond)
 
 def f_true_density_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -805,6 +807,50 @@ def f_true_density(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) 
         return f_true_density_B2(cfg, x, v, y)
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
+
+
+def sample_eps_given_eta(cfg: DGPConfig,
+                         eta: np.ndarray,
+                         rng: np.random.Generator) -> np.ndarray:
+    """Sample ε | η under the joint normal copula used in the DGP."""
+    eta_arr = np.asarray(eta, dtype=float)
+    t = norm.ppf(np.clip(eta_arr, V_EPSILON, 1.0 - V_EPSILON))
+    mean = cfg.rho * t
+    var_eps = max(1.0 - cfg.rho ** 2, 1e-12)
+    return rng.normal(loc=mean, scale=np.sqrt(var_eps), size=eta_arr.shape)
+
+
+def simulate_y_given_x_eps(cfg: DGPConfig,
+                           x_value: float,
+                           eps_draws: np.ndarray) -> np.ndarray:
+    """Evaluate Y given X=x and sampled ε draws."""
+    eps_arr = np.asarray(eps_draws, dtype=float)
+    x_arr = np.full_like(eps_arr, float(x_value), dtype=float)
+
+    if cfg.second_stage == "B1":
+        sigma_y = sigmaY_of_X(x_arr, cfg)
+        m1 = cfg.beta1 * x_arr + cfg.beta2 * (x_arr ** 2)
+        return m1 + sigma_y * eps_arr
+    elif cfg.second_stage == "B2":
+        return np.sin(x_arr) + 0.5 * x_arr * eps_arr + 0.5 * (eps_arr ** 2)
+    else:
+        raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
+
+
+def monte_carlo_y_given_x(cfg: DGPConfig,
+                          x_value: float,
+                          n_samples: int,
+                          rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Monte Carlo sampler for Y|do(X=x):
+      1. Draw η ~ Uniform(0,1) (control function under intervention)
+      2. Draw ε ~ N(ρ Φ^{-1}(η), 1-ρ²)
+      3. Evaluate Y with the DGP second-stage equation.
+    """
+    eta_samples = rng.uniform(low=V_EPSILON, high=1.0 - V_EPSILON, size=n_samples)
+    eps_samples = sample_eps_given_eta(cfg, eta_samples, rng)
+    y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples)
+    return y_samples, eta_samples, eps_samples
 
 
 def compute_true_interventional_cdf(cfg: DGPConfig,
@@ -946,6 +992,7 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     sys.stdout.flush()
 
     set_seed(cfg.random_state)
+    rng = np.random.default_rng(cfg.random_state)
 
     components = prepare_stage2_components(cfg)
     train_data = components["train_data"]
@@ -1009,8 +1056,35 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     kde_indices = select_kde_indices(len(x_test_grid), cfg.kde_quantiles)
     kde_x_values = x_test_grid[kde_indices]
     kde_pdf_est = interventional_pdf_est["pdf"][kde_indices, :]
-    kde_pdf_true = interventional_pdf_true["pdf"][kde_indices, :]
+    # Closed-form density (kept for reference):
+    # kde_pdf_true = interventional_pdf_true["pdf"][kde_indices, :]
     kde_y_observed = y_test_grid[kde_indices]
+
+    kde_y_samples: list[np.ndarray] = []
+    kde_eta_samples: list[np.ndarray] = []
+    kde_eps_samples: list[np.ndarray] = []
+    kde_pdf_true_rows: list[np.ndarray] = []
+
+    for x0 in kde_x_values:
+        y_draws, eta_draws, eps_draws = monte_carlo_y_given_x(
+            dgp_cfg,
+            float(x0),
+            cfg.kde_sample_size,
+            rng,
+        )
+        kde_y_samples.append(y_draws)
+        kde_eta_samples.append(eta_draws)
+        kde_eps_samples.append(eps_draws)
+        try:
+            density_estimator = gaussian_kde(y_draws)
+            density = density_estimator(y_grid)
+        except np.linalg.LinAlgError:
+            jitter = 1e-6 * rng.standard_normal(size=y_draws.shape)
+            density_estimator = gaussian_kde(y_draws + jitter)
+            density = density_estimator(y_grid)
+        kde_pdf_true_rows.append(np.maximum(density, 0.0))
+
+    kde_pdf_true = np.vstack(kde_pdf_true_rows)
 
     # --- Metrics ---
     pdf_est_matrix = interventional_pdf_est["pdf"]
@@ -1080,7 +1154,10 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
             "pdf_estimated": kde_pdf_est,
             "pdf_true": kde_pdf_true,
             "y_grid": y_grid,
-            "quantiles": np.asarray(cfg.kde_quantiles, dtype=float)
+            "quantiles": np.asarray(cfg.kde_quantiles, dtype=float),
+            "y_samples_true": np.asarray(kde_y_samples),
+            "eta_samples": np.asarray(kde_eta_samples),
+            "eps_samples": np.asarray(kde_eps_samples),
         },
         "metrics": metrics,
         "metadata": {
@@ -1274,7 +1351,7 @@ if __name__ == "__main__":
         include_oracle=True,
         first_stage_code="A1",
         second_stage_code="B1",
-        kde_quantiles=(0.25, 0.5, 0.75),
+        kde_quantiles=(0.05, 0.5, 0.95),
         kde_sample_size=1000
     )
 

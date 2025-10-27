@@ -71,6 +71,14 @@ def sigma_of_Z(z: np.ndarray, cfg: DGPConfig) -> np.ndarray:
     return np.exp(cfg.gamma0 + cfg.gamma1 * z)
 
 
+def sigmaY_of_X(x: np.ndarray, cfg: DGPConfig) -> np.ndarray:
+    """Outcome noise scale σ_Y(X) for second-stage B1 specification."""
+    x_arr = np.asarray(x, dtype=float)
+    if cfg.second_stage != "B1":
+        raise ValueError("sigmaY_of_X is only defined for second_stage='B1'.")
+    return np.log1p(np.exp(cfg.delta0 + cfg.delta1 * x_arr))
+
+
 def a2_h_transform(t: np.ndarray, cfg: DGPConfig) -> np.ndarray:
     """Non-linear transformation for A2 first-stage"""
     if cfg.a2_h == "exp":
@@ -97,6 +105,7 @@ def simulate_eps_eta(n: int, rho: float) -> Tuple[np.ndarray, np.ndarray]:
     cov = np.array([[1.0, rho], [rho, 1.0]])
     L = np.linalg.cholesky(cov)
     Z0 = np.random.randn(2, n)
+    #Z0 = np.random.uniform(0, 3, (2, n))
     E, T = L @ Z0
     eps = E
     eta = norm.cdf(T)  # in (0,1)
@@ -104,6 +113,7 @@ def simulate_eps_eta(n: int, rho: float) -> Tuple[np.ndarray, np.ndarray]:
 
 
 def simulate_first_stage(cfg: DGPConfig, Z: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    
     """
     Generate X = G(Z, η) according to first-stage specification.
     
@@ -116,6 +126,7 @@ def simulate_first_stage(cfg: DGPConfig, Z: np.ndarray, eta: np.ndarray) -> Tupl
         X: (n,) array of endogenous regressors
         V_true: (n,) array of true control function values (= η)
     """
+
     mu = mu_of_Z(Z, cfg)
     sig = sigma_of_Z(Z, cfg)
     t = mu + sig * norm.ppf(eta)  # location-scale index
@@ -146,7 +157,7 @@ def simulate_second_stage(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps
     """
     if cfg.second_stage == "B1":
         m1 = cfg.beta1 * X + cfg.beta2 * (X ** 2)
-        sigY = np.exp(cfg.delta0 + cfg.delta1 * V_true)
+        sigY = sigmaY_of_X(X, cfg)
         # Nonzero E[ε|V] under joint normal:  E[ε | V=v] = ρ Φ^{-1}(v)
         # We simulate Y directly; the conditional mean is handled in m_true().
         Y = m1 + sigY * eps
@@ -175,7 +186,8 @@ def simulate_dataset(cfg: DGPConfig) -> Dict[str, np.ndarray]:
     """
     set_seed(cfg.seed)
     n = cfg.n
-    Z = np.random.randn(n)
+    #Z = np.random.randn(n)
+    Z = np.random.uniform(0, 3, n)
     eps, eta = simulate_eps_eta(n, cfg.rho)
     X, V_true = simulate_first_stage(cfg, Z, eta)
     Y = simulate_second_stage(cfg, X, V_true, eps)
