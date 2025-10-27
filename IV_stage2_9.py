@@ -809,15 +809,14 @@ def f_true_density(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) 
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
 
-def sample_eps_given_eta(cfg: DGPConfig,
-                         eta: np.ndarray,
-                         rng: np.random.Generator) -> np.ndarray:
-    """Sample ε | η under the joint normal copula used in the DGP."""
-    eta_arr = np.asarray(eta, dtype=float)
-    t = norm.ppf(np.clip(eta_arr, V_EPSILON, 1.0 - V_EPSILON))
-    mean = cfg.rho * t
-    var_eps = max(1.0 - cfg.rho ** 2, 1e-12)
-    return rng.normal(loc=mean, scale=np.sqrt(var_eps), size=eta_arr.shape)
+def sample_eps_marginal(n_samples: int, rng: np.random.Generator) -> np.ndarray:
+    """
+    Sample ε from its marginal distribution.
+    
+    Under the joint normal construction used in the DGP, ε ~ N(0, 1).
+    We keep this helper in case future DGP variants change the marginal.
+    """
+    return rng.standard_normal(size=n_samples)
 
 
 def simulate_y_given_x_eps(cfg: DGPConfig,
@@ -840,17 +839,59 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
 def monte_carlo_y_given_x(cfg: DGPConfig,
                           x_value: float,
                           n_samples: int,
-                          rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                          rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray]:
     """
     Monte Carlo sampler for Y|do(X=x):
-      1. Draw η ~ Uniform(0,1) (control function under intervention)
-      2. Draw ε ~ N(ρ Φ^{-1}(η), 1-ρ²)
-      3. Evaluate Y with the DGP second-stage equation.
+      1. Draw ε from its marginal distribution (N(0,1) under current DGP)
+      2. Evaluate Y with the DGP second-stage equation.
+
+    Previous versions sampled ε | η; that path is retained in comments for reference.
     """
-    eta_samples = rng.uniform(low=V_EPSILON, high=1.0 - V_EPSILON, size=n_samples)
-    eps_samples = sample_eps_given_eta(cfg, eta_samples, rng)
+    eps_samples = sample_eps_marginal(n_samples, rng)
+    # Reference implementation (kept for clarity):
+    # eta_samples = rng.uniform(low=V_EPSILON, high=1.0 - V_EPSILON, size=n_samples)
+    # eps_samples = sample_eps_given_eta(cfg, eta_samples, rng)
     y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples)
-    return y_samples, eta_samples, eps_samples
+    return y_samples, eps_samples
+
+
+def sample_tabpfn_y_given_x(cdf_model: ConditionalCDFEstimator,
+                            x_value: float,
+                            n_samples: int,
+                            y_support: np.ndarray,
+                            rng: np.random.Generator) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Draw samples from the TabPFN-estimated interventional distribution Y|do(X=x).
+
+    We rely on inverse transform sampling using the criterion-based CDF evaluated
+    on a shared y-support grid to stay aligned with the KDE diagnostics.
+    """
+    y_support = np.asarray(y_support, dtype=float)
+    if y_support.ndim != 1:
+        raise ValueError("y_support must be a 1-D array for inverse transform sampling.")
+
+    v_samples = rng.uniform(low=V_EPSILON, high=1.0 - V_EPSILON, size=n_samples)
+    u_samples = rng.uniform(low=0.0, high=1.0, size=n_samples)
+    x_vec = np.full(n_samples, float(x_value), dtype=float)
+
+    full_output = cdf_model.predict_full_distribution(x_vec, v_samples)
+    cdf_vals = np.asarray(
+        cdf_from_full_output(full_output, y_support, squeeze_last=False),
+        dtype=float,
+    )
+    if cdf_vals.ndim == 1:
+        cdf_vals = cdf_vals.reshape(1, -1)
+
+    y_samples = np.empty(n_samples, dtype=float)
+    for idx in range(n_samples):
+        row = np.asarray(cdf_vals[idx], dtype=float)
+        row = np.clip(row, 0.0, 1.0)
+        row = np.maximum.accumulate(row)
+        row[-1] = 1.0
+        row[0] = max(row[0], 0.0)
+        y_samples[idx] = np.interp(u_samples[idx], row, y_support)
+
+    return y_samples, v_samples, u_samples
 
 
 def compute_true_interventional_cdf(cfg: DGPConfig,
@@ -1055,60 +1096,69 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
 
     kde_indices = select_kde_indices(len(x_test_grid), cfg.kde_quantiles)
     kde_x_values = x_test_grid[kde_indices]
-    kde_pdf_est = interventional_pdf_est["pdf"][kde_indices, :]
-    # Closed-form density (kept for reference):
-    # kde_pdf_true = interventional_pdf_true["pdf"][kde_indices, :]
     kde_y_observed = y_test_grid[kde_indices]
 
-    kde_y_samples: list[np.ndarray] = []
-    kde_eta_samples: list[np.ndarray] = []
-    kde_eps_samples: list[np.ndarray] = []
+    kde_y_samples_true: list[np.ndarray] = []
+    kde_eps_samples_true: list[np.ndarray] = []
+    kde_y_samples_est: list[np.ndarray] = []
+    kde_v_samples_est: list[np.ndarray] = []
+    kde_u_samples_est: list[np.ndarray] = []
     kde_pdf_true_rows: list[np.ndarray] = []
+    kde_pdf_est_rows: list[np.ndarray] = []
 
     for x0 in kde_x_values:
-        y_draws, eta_draws, eps_draws = monte_carlo_y_given_x(
+        y_draws_true, eps_draws_true = monte_carlo_y_given_x(
             dgp_cfg,
             float(x0),
             cfg.kde_sample_size,
             rng,
         )
-        kde_y_samples.append(y_draws)
-        kde_eta_samples.append(eta_draws)
-        kde_eps_samples.append(eps_draws)
+        y_draws_est, v_draws_est, u_draws_est = sample_tabpfn_y_given_x(
+            cdf_model,
+            float(x0),
+            cfg.kde_sample_size,
+            y_grid,
+            rng,
+        )
+
+        kde_y_samples_true.append(y_draws_true)
+        kde_eps_samples_true.append(eps_draws_true)
+        kde_y_samples_est.append(y_draws_est)
+        kde_v_samples_est.append(v_draws_est)
+        kde_u_samples_est.append(u_draws_est)
+
         try:
-            density_estimator = gaussian_kde(y_draws)
-            density = density_estimator(y_grid)
+            density_true = gaussian_kde(y_draws_true)
+            pdf_true_row = density_true(y_grid)
         except np.linalg.LinAlgError:
-            jitter = 1e-6 * rng.standard_normal(size=y_draws.shape)
-            density_estimator = gaussian_kde(y_draws + jitter)
-            density = density_estimator(y_grid)
-        kde_pdf_true_rows.append(np.maximum(density, 0.0))
+            jitter = 1e-6 * rng.standard_normal(size=y_draws_true.shape)
+            density_true = gaussian_kde(y_draws_true + jitter)
+            pdf_true_row = density_true(y_grid)
+
+        try:
+            density_est = gaussian_kde(y_draws_est)
+            pdf_est_row = density_est(y_grid)
+        except np.linalg.LinAlgError:
+            jitter_est = 1e-6 * rng.standard_normal(size=y_draws_est.shape)
+            density_est = gaussian_kde(y_draws_est + jitter_est)
+            pdf_est_row = density_est(y_grid)
+
+        kde_pdf_true_rows.append(np.maximum(pdf_true_row, 0.0))
+        kde_pdf_est_rows.append(np.maximum(pdf_est_row, 0.0))
 
     kde_pdf_true = np.vstack(kde_pdf_true_rows)
+    kde_pdf_est = np.vstack(kde_pdf_est_rows)
 
-    # --- Metrics ---
-    pdf_est_matrix = interventional_pdf_est["pdf"]
-    pdf_true_matrix = interventional_pdf_true["pdf"]
-    cdf_est_matrix = interventional_est["F_interventional"]
-    cdf_true_matrix = interventional_true["F_interventional"]
-
-    iae_per_x = np.trapz(np.abs(pdf_est_matrix - pdf_true_matrix), y_grid, axis=1)
-    ks_per_x = np.max(np.abs(cdf_est_matrix - cdf_true_matrix), axis=1)
-    cvm_per_x = np.trapz((cdf_est_matrix - cdf_true_matrix) ** 2, y_grid, axis=1)
-    mse_do_pred = float(np.mean((mu_c_test_estimated - Y_test_subset) ** 2))
-
+    iae_per_x = np.trapz(np.abs(kde_pdf_est - kde_pdf_true), x=y_grid, axis=1)
     metrics = {
-        "mse_do_pred_vs_true": mse_do_pred,
         "iae_mean": float(np.mean(iae_per_x)),
         "iae_max": float(np.max(iae_per_x)),
-        "ks_mean": float(np.mean(ks_per_x)),
-        "ks_max": float(np.max(ks_per_x)),
-        "cvm_mean": float(np.mean(cvm_per_x)),
-        "cvm_max": float(np.max(cvm_per_x)),
         "iae_per_x": iae_per_x,
-        "ks_per_x": ks_per_x,
-        "cvm_per_x": cvm_per_x
     }
+
+    # --- Metrics ---
+    mse_do_pred = float(np.mean((mu_c_test_estimated - Y_test_subset) ** 2))
+    metrics["mse_do_pred_vs_true"] = mse_do_pred
 
     return {
         "config": asdict(cfg),
@@ -1155,9 +1205,11 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
             "pdf_true": kde_pdf_true,
             "y_grid": y_grid,
             "quantiles": np.asarray(cfg.kde_quantiles, dtype=float),
-            "y_samples_true": np.asarray(kde_y_samples),
-            "eta_samples": np.asarray(kde_eta_samples),
-            "eps_samples": np.asarray(kde_eps_samples),
+            "y_samples_true": np.asarray(kde_y_samples_true),
+            "eps_samples_true": np.asarray(kde_eps_samples_true),
+            "y_samples_est": np.asarray(kde_y_samples_est),
+            "v_samples_est": np.asarray(kde_v_samples_est),
+            "u_samples_est": np.asarray(kde_u_samples_est),
         },
         "metrics": metrics,
         "metadata": {
@@ -1208,23 +1260,6 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
     predictions_df.to_csv(predictions_csv, index=False)
     print(f"✅ Predictions saved to: {predictions_csv}")
     artifact_names.append(os.path.basename(predictions_csv))
-
-    # μ_c curves CSV
-    mu_c = results["mu_c"]
-    mu_c_data = {
-        "x_test": mu_c["x_test_grid"],
-        "y_test": mu_c["y_test_grid"],
-        "mu_c_estimated": mu_c["estimated"],
-    }
-    if mu_c["oracle"] is not None:
-        mu_c_data["mu_c_oracle"] = mu_c["oracle"]
-    else:
-        mu_c_data["mu_c_oracle"] = np.nan
-    mu_c_df = pd.DataFrame(mu_c_data)
-    mu_c_csv = os.path.join(output_dir, f"iv_stage2_9_{codes}_mu_c_curves_{timestamp}.csv")
-    mu_c_df.to_csv(mu_c_csv, index=False)
-    print(f"✅ μ_c curves saved to: {mu_c_csv}")
-    artifact_names.append(os.path.basename(mu_c_csv))
 
     # Interventional CDF CSV (long format)
     interventional_est = results["interventional_cdf"]["estimated"]
@@ -1285,16 +1320,8 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
         summary_rows.append({"key": "metric_mse_do_pred_vs_true", "value": f"{metrics['mse_do_pred_vs_true']:.6f}"})
         summary_rows.append({"key": "metric_iae_mean", "value": f"{metrics['iae_mean']:.6f}"})
         summary_rows.append({"key": "metric_iae_max", "value": f"{metrics['iae_max']:.6f}"})
-        summary_rows.append({"key": "metric_ks_mean", "value": f"{metrics['ks_mean']:.6f}"})
-        summary_rows.append({"key": "metric_ks_max", "value": f"{metrics['ks_max']:.6f}"})
-        summary_rows.append({"key": "metric_cvm_mean", "value": f"{metrics['cvm_mean']:.6f}"})
-        summary_rows.append({"key": "metric_cvm_max", "value": f"{metrics['cvm_max']:.6f}"})
         iae_series = ";".join(f"{val:.6f}" for val in metrics['iae_per_x'])
-        ks_series = ";".join(f"{val:.6f}" for val in metrics['ks_per_x'])
-        cvm_series = ";".join(f"{val:.6f}" for val in metrics['cvm_per_x'])
         summary_rows.append({"key": "metric_iae_per_x", "value": iae_series})
-        summary_rows.append({"key": "metric_ks_per_x", "value": ks_series})
-        summary_rows.append({"key": "metric_cvm_per_x", "value": cvm_series})
 
     kde = results.get("kde")
     if kde is not None:
@@ -1351,7 +1378,7 @@ if __name__ == "__main__":
         include_oracle=True,
         first_stage_code="A1",
         second_stage_code="B1",
-        kde_quantiles=(0.05, 0.5, 0.95),
+        kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
         kde_sample_size=1000
     )
 
