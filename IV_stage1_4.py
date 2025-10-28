@@ -231,7 +231,7 @@ class CondCDFModel:
             X_test: (n_test,) endogenous regressor values
         
         Returns:
-            V_hat: (n_test,) estimated control function values
+            V_hat: (n_test,) estimated control function values, uniformly distributed on [0,1]
         """
         if self.reg is None:
             raise RuntimeError("Model must be fitted before prediction.")
@@ -401,3 +401,4 @@ if __name__ == "__main__":
         print(f"\n❌ Experiment failed with error: {e}")
         import traceback
         traceback.print_exc()
+

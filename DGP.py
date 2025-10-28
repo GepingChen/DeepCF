@@ -155,6 +155,7 @@ def simulate_second_stage(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps
     Returns:
         Y: (n,) array of outcomes
     """
+    
     if cfg.second_stage == "B1":
         m1 = cfg.beta1 * X + cfg.beta2 * (X ** 2)
         sigY = sigmaY_of_X(X, cfg)
