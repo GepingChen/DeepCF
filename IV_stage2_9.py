@@ -1384,7 +1384,7 @@ if __name__ == "__main__":
         first_stage_code="A1",
         second_stage_code="B1",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
-        kde_sample_size=1000
+        kde_sample_size=1001
     )
 
     print(f"Configuration: {cfg}", flush=True)
