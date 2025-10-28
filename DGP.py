@@ -51,6 +51,13 @@ class DGPConfig:
     beta2: float = 0.5
     delta0: float = -0.5                    # σ_Y(V) = exp(δ0 + δ1 V)
     delta1: float = 0.7
+    
+    # B2 bimodal parameters (B2 always uses bimodal mixture)
+    b2_mixture_weight: float = 0.5              # w: mixture weight for bimodal
+    b2_peak_separation: float = 2.0             # Δμ: separation between peaks
+    b2_sigma1: float = 0.3                      # σ₁: first component std
+    b2_sigma2: float = 0.3                      # σ₂: second component std
+    b2_beta_offset: float = 1.0                 # offset for second peak
 
 
 # =========================================================
@@ -112,6 +119,48 @@ def simulate_eps_eta(n: int, rho: float) -> Tuple[np.ndarray, np.ndarray]:
     return eps, eta
 
 
+def simulate_bimodal_y(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps: np.ndarray) -> np.ndarray:
+    """
+    Generate Y from bimodal mixture of normals for B2-bimodal.
+    
+    Y follows mixture: w·N(μ₁, σ₁) + (1-w)·N(μ₂, σ₂)
+    where each component mean depends on (X, V, ε).
+    
+    Args:
+        cfg: DGP configuration
+        X: (n,) endogenous regressor
+        V_true: (n,) control function values
+        eps: (n,) error terms from MARGINAL N(0,1)
+    
+    Returns:
+        Y: (n,) bimodal outcomes
+    """
+    n = len(X)
+    
+    # Draw mixture indicators (which component each obs comes from)
+    mixture_indicators = np.random.binomial(1, cfg.b2_mixture_weight, size=n)
+    
+    # Component means (both depend on X, eps)
+    # First peak: similar to original sin-based B2
+    mu1 = np.sin(X) + 0.3 * X * eps
+    
+    # Second peak: offset version
+    mu2 = np.sin(X + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * X * eps
+    
+    # Component standard deviations (X-dependent heteroskedasticity)
+    sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(X))
+    sigma2 = cfg.b2_sigma2 * (1.0 + 0.3 * np.abs(X))
+    
+    # Generate from each component
+    y1 = mu1 + sigma1 * np.random.randn(n)
+    y2 = mu2 + sigma2 * np.random.randn(n)
+    
+    # Mix according to indicators
+    Y = mixture_indicators * y1 + (1 - mixture_indicators) * y2
+    
+    return Y
+
+
 def simulate_first_stage(cfg: DGPConfig, Z: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     
     """
@@ -164,7 +213,8 @@ def simulate_second_stage(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps
         Y = m1 + sigY * eps
         return Y
     elif cfg.second_stage == "B2":
-        return np.sin(X) + 0.5 * X * eps + 0.5 * (eps ** 2)
+        # B2 always uses bimodal mixture of normals
+        return simulate_bimodal_y(cfg, X, V_true, eps)
     else:
         raise ValueError("Unknown second_stage")
 
@@ -387,7 +437,7 @@ if __name__ == "__main__":
         seed=123,
         rho=0.6,
         first_stage="A1",
-        second_stage="B1"
+        second_stage="B2"
     )
     
     # Create configuration for test data  
@@ -396,7 +446,7 @@ if __name__ == "__main__":
         seed=999,
         rho=0.6,
         first_stage="A1",
-        second_stage="B1"
+        second_stage="B2"
     )
     
     print("Configuration:")

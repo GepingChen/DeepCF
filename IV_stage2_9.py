@@ -76,11 +76,12 @@ def m_true(cfg: DGPConfig, x: np.ndarray, v: np.ndarray) -> np.ndarray:
         return cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigY * e_mean
 
     elif cfg.second_stage == "B2":
-        # m(x,v) = sin(x) + 0.5 x E[ε|V=v] + 0.5 E[ε^2|V=v]
+        # B2 uses bimodal mixture: E[Y|X,V] = w·μ₁ + (1-w)·μ₂
         e_mean = cfg.rho * t
-        e_var = 1.0 - cfg.rho ** 2      # Var(ε | T=t) under joint normal
-        e_second = e_var + (e_mean ** 2)
-        return np.sin(x) + 0.5 * x * e_mean + 0.5 * e_second
+        w = cfg.b2_mixture_weight
+        mu1 = np.sin(x) + 0.3 * x * e_mean
+        mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
+        return w * mu1 + (1 - w) * mu2
 
     else:
         raise ValueError("Unknown second_stage")
@@ -749,18 +750,35 @@ def F_true_conditional_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.nd
 
 
 def F_true_conditional_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    True conditional CDF F(y|x,v) for bimodal B2.
+    Mixture CDF: w·Φ₁ + (1-w)·Φ₂
+    """
     x = np.asarray(x)
     v = np.asarray(v)
     y = np.asarray(y)
+    
     t = norm.ppf(v)
     e_mean = cfg.rho * t
     e_var = 1.0 - cfg.rho ** 2
-    mu_cond = np.sin(x) + 0.5 * x * e_mean + 0.5 * (e_var + e_mean ** 2)
-    var_eps_squared = 2 * e_var ** 2 + 4 * e_mean ** 2 * e_var
-    cov_eps_eps_squared = 2 * e_mean * e_var
-    sigma_cond_sq = 0.25 * x ** 2 * e_var + 0.25 * var_eps_squared + 0.5 * x * cov_eps_eps_squared
-    sigma_cond = np.sqrt(np.maximum(sigma_cond_sq, 1e-10))
-    return norm.cdf(y, loc=mu_cond, scale=sigma_cond)
+    e_std = np.sqrt(np.maximum(e_var, 1e-10))
+    
+    # Component parameters (same as density function)
+    mu1 = np.sin(x) + 0.3 * x * e_mean
+    mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
+    
+    sigma1_base = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x))
+    sigma2_base = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x))
+    
+    sigma1_total = np.sqrt(sigma1_base**2 + (0.3 * x)**2 * e_var)
+    sigma2_total = np.sqrt(sigma2_base**2 + (0.3 * x)**2 * e_var)
+    
+    # Mixture CDF
+    w = cfg.b2_mixture_weight
+    cdf1 = norm.cdf(y, loc=mu1, scale=sigma1_total)
+    cdf2 = norm.cdf(y, loc=mu2, scale=sigma2_total)
+    
+    return w * cdf1 + (1 - w) * cdf2
 
 
 def F_true_conditional(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -784,18 +802,40 @@ def f_true_density_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarra
     return norm.pdf(y, loc=mu_cond, scale=sigma_cond)
 
 def f_true_density_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    True conditional density f(y|x,v) for bimodal B2.
+    
+    CRITICAL: This is f(y|x,v), NOT f(y|do(x)).
+    The density is a mixture of two normals with means depending on E[ε|V=v].
+    """
     x = np.asarray(x)
     v = np.asarray(v)
     y = np.asarray(y)
+    
+    # Conditional distribution of ε given V
     t = norm.ppf(v)
-    e_mean = cfg.rho * t
-    e_var = 1.0 - cfg.rho ** 2
-    mu_cond = np.sin(x) + 0.5 * x * e_mean + 0.5 * (e_var + e_mean ** 2)
-    var_eps_squared = 2 * e_var ** 2 + 4 * e_mean ** 2 * e_var
-    cov_eps_eps_squared = 2 * e_mean * e_var
-    sigma_cond_sq = 0.25 * x ** 2 * e_var + 0.25 * var_eps_squared + 0.5 * x * cov_eps_eps_squared
-    sigma_cond = np.sqrt(np.maximum(sigma_cond_sq, 1e-10))
-    return norm.pdf(y, loc=mu_cond, scale=sigma_cond)
+    e_mean = cfg.rho * t  # E[ε|V=v]
+    e_var = 1.0 - cfg.rho ** 2  # Var(ε|V=v)
+    e_std = np.sqrt(np.maximum(e_var, 1e-10))
+    
+    # Component means
+    mu1 = np.sin(x) + 0.3 * x * e_mean
+    mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
+    
+    # Component standard deviations (include both model noise and ε uncertainty)
+    sigma1_base = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x))
+    sigma2_base = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x))
+    
+    # Total variance: model noise + contribution from ε|V variance
+    sigma1_total = np.sqrt(sigma1_base**2 + (0.3 * x)**2 * e_var)
+    sigma2_total = np.sqrt(sigma2_base**2 + (0.3 * x)**2 * e_var)
+    
+    # Mixture density
+    w = cfg.b2_mixture_weight
+    pdf1 = norm.pdf(y, loc=mu1, scale=sigma1_total)
+    pdf2 = norm.pdf(y, loc=mu2, scale=sigma2_total)
+    
+    return w * pdf1 + (1 - w) * pdf2
 
 
 def f_true_density(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -820,7 +860,11 @@ def sample_eps_marginal(n_samples: int, rng: np.random.Generator) -> np.ndarray:
 def simulate_y_given_x_eps(cfg: DGPConfig,
                            x_value: float,
                            eps_draws: np.ndarray) -> np.ndarray:
-    """Evaluate Y given X=x and sampled ε draws."""
+    """
+    Evaluate Y given X=x and sampled ε draws.
+    
+    CRITICAL: eps_draws must come from marginal N(0,1), not ε|V.
+    """
     eps_arr = np.asarray(eps_draws, dtype=float)
     x_arr = np.full_like(eps_arr, float(x_value), dtype=float)
 
@@ -829,7 +873,20 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         m1 = cfg.beta1 * x_arr + cfg.beta2 * (x_arr ** 2)
         return m1 + sigma_y * eps_arr
     elif cfg.second_stage == "B2":
-        return np.sin(x_arr) + 0.5 * x_arr * eps_arr + 0.5 * (eps_arr ** 2)
+        # B2 uses bimodal mixture - generate Y using marginal ε
+        n = len(eps_arr)
+        mixture_indicators = np.random.binomial(1, cfg.b2_mixture_weight, size=n)
+        
+        mu1 = np.sin(x_arr) + 0.3 * x_arr * eps_arr
+        mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x_arr * eps_arr
+        
+        sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x_arr))
+        sigma2 = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x_arr))
+        
+        y1 = mu1 + sigma1 * np.random.randn(n)
+        y2 = mu2 + sigma2 * np.random.randn(n)
+        
+        return mixture_indicators * y1 + (1 - mixture_indicators) * y2
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -898,7 +955,11 @@ def compute_y_clean(cfg: DGPConfig, x: np.ndarray) -> np.ndarray:
     if cfg.second_stage == "B1":
         return cfg.beta1 * x_arr + cfg.beta2 * (x_arr ** 2)
     elif cfg.second_stage == "B2":
-        return np.sin(x_arr) + 0.5  # E[ε]=0, E[ε²]=1
+        # B2 uses bimodal mixture: weighted mean with E[ε]=0
+        w = cfg.b2_mixture_weight
+        mu1 = np.sin(x_arr)
+        mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation
+        return w * mu1 + (1 - w) * mu2
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -1382,9 +1443,9 @@ if __name__ == "__main__":
         use_tabpfn=True,
         include_oracle=True,
         first_stage_code="A1",
-        second_stage_code="B1",
+        second_stage_code="B2",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
-        kde_sample_size=1001
+        kde_sample_size=1000
     )
 
     print(f"Configuration: {cfg}", flush=True)
