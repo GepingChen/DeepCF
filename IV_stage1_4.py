@@ -340,7 +340,7 @@ if __name__ == "__main__":
     
     # DGP parameters (default values)
     first_stage = "A3"
-    second_stage = "B4"
+    second_stage = "B5"
     
     # Stage 1 estimation configuration
     stage1_cfg = Stage1Config(
