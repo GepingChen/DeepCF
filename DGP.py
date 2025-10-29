@@ -46,7 +46,7 @@ class DGPConfig:
     a2_h: Literal["exp", "cubic"] = "exp"   # A2 transform
 
     # Second-stage family: Y = H(X, ε)
-    second_stage: Literal["B1", "B2", "B3"] = "B1"
+    second_stage: Literal["B1", "B2", "B3", "B4"] = "B1"
     beta1: float = 1.0
     beta2: float = 0.5
     delta0: float = -0.5                    # σ_Y(V) = exp(δ0 + δ1 V)
@@ -225,6 +225,22 @@ def simulate_second_stage(
         if latent_h is None:
             raise ValueError("Second-stage B3 requires latent_h draws.")
         return X - 3.0 * latent_h + eps
+    elif cfg.second_stage == "B4":
+        if latent_h is None:
+            raise ValueError("Second-stage B4 requires latent_h draws.")
+        h_arr = np.asarray(latent_h, dtype=float)
+        if h_arr.shape != X.shape:
+            raise ValueError("latent_h must have same shape as X for B4.")
+        eps_arr = np.asarray(eps, dtype=float)
+        if eps_arr.shape != X.shape:
+            raise ValueError("eps must have same shape as X for B4.")
+
+        linear_branch = 0.2 * (5.5 + 2.0 * X + 3.0 * h_arr + eps_arr)
+        # Ensure argument of log stays positive; clamp at a small epsilon.
+        softplus_arg = (2.0 * X + h_arr) ** 2 + eps_arr
+        safe_arg = np.maximum(softplus_arg, 1e-8)
+        softplus_branch = np.log(safe_arg)
+        return np.where(X <= 1.0, linear_branch, softplus_branch)
     else:
         raise ValueError("Unknown second_stage")
 
@@ -250,8 +266,8 @@ def simulate_dataset(cfg: DGPConfig) -> Dict[str, np.ndarray]:
     #Z = np.random.randn(n)
     Z = np.random.uniform(0, 3, n)
     if cfg.first_stage == "A3":
-        if cfg.second_stage != "B3":
-            raise ValueError("First-stage 'A3' is currently only supported with second-stage 'B3'.")
+        if cfg.second_stage not in {"B3", "B4"}:
+            raise ValueError("First-stage 'A3' currently supports second-stage 'B3' or 'B4' only.")
         latent_h = np.random.randn(n)
         eps_x = np.random.randn(n)
         eps_y = np.random.randn(n)
@@ -473,7 +489,7 @@ if __name__ == "__main__":
         seed=123,
         rho=0.6,
         first_stage="A3",
-        second_stage="B3"
+        second_stage="B4"
     )
     
     # Create configuration for test data  
@@ -482,7 +498,7 @@ if __name__ == "__main__":
         seed=999,
         rho=0.6,
         first_stage="A3",
-        second_stage="B3"
+        second_stage="B4"
     )
     
     print("Configuration:")

@@ -35,6 +35,7 @@ import torch
 from DGP import DGPConfig, set_seed, sigmaY_of_X
 
 V_EPSILON = 1e-6  # Avoid norm.ppf endpoints
+B4_SOFTPLUS_EPS = 1e-8  # Match numerical guard in DGP B4 branch
 
 # --- TabPFN (with fallbacks) ---
 try:
@@ -692,160 +693,6 @@ def compute_interventional_pdf(cdf_model: ConditionalCDFEstimator,
         "pdf": pdf_interventional
     }
 
-# ---------------------------------------------------------
-# TRUE CONDITIONAL CDF UTILITIES
-# ---------------------------------------------------------
-def F_true_conditional_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    x = np.asarray(x)
-    v = np.asarray(v)
-    y = np.asarray(y)
-    t = norm.ppf(v)
-    e_mean = cfg.rho * t
-    sigY = sigmaY_of_X(x, cfg)
-    sigma_eps = np.sqrt(max(1.0 - cfg.rho ** 2, 1e-12))
-    mu_cond = cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigY * e_mean
-    sigma_cond = sigY * sigma_eps
-    return norm.cdf(y, loc=mu_cond, scale=sigma_cond)
-
-
-def F_true_conditional_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """
-    True conditional CDF F(y|x,v) for bimodal B2.
-    Mixture CDF: w·Φ₁ + (1-w)·Φ₂
-    """
-    x = np.asarray(x)
-    v = np.asarray(v)
-    y = np.asarray(y)
-
-    t = norm.ppf(v)
-    e_mean = cfg.rho * t
-    e_var = 1.0 - cfg.rho ** 2
-    e_std = np.sqrt(np.maximum(e_var, 1e-10))
-
-    # Component parameters (same as density function)
-    mu1 = np.sin(x) + 0.3 * x * e_mean
-    mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
-
-    sigma1_base = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x))
-    sigma2_base = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x))
-
-    sigma1_total = np.sqrt(sigma1_base**2 + (0.3 * x)**2 * e_var)
-    sigma2_total = np.sqrt(sigma2_base**2 + (0.3 * x)**2 * e_var)
-
-    # Mixture CDF
-    w = cfg.b2_mixture_weight
-    cdf1 = norm.cdf(y, loc=mu1, scale=sigma1_total)
-    cdf2 = norm.cdf(y, loc=mu2, scale=sigma2_total)
-
-    return w * cdf1 + (1 - w) * cdf2
-
-
-def F_true_conditional_B3(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """
-    True conditional CDF F(y|x,v) for additive latent-factor DGP (A3/B3).
-
-    Given V = F_{X|Z}(X|Z), we recover Z and the latent sum H+ε_x, yielding
-    H | (X,V) ~ N(s/2, 1/2) with s = sqrt(2) Φ^{-1}(V). Plugging into
-    Y = X - 3H + ε_y gives a normal distribution with closed-form moments.
-    """
-    x = np.asarray(x, dtype=float)
-    v = np.asarray(v, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    t = norm.ppf(v)
-    mean = x - (3.0 / np.sqrt(2.0)) * t
-    std = np.sqrt(11.0 / 2.0)
-    return norm.cdf(y, loc=mean, scale=std)
-
-
-def F_true_conditional(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    if cfg.second_stage == "B1":
-        return F_true_conditional_B1(cfg, x, v, y)
-    elif cfg.second_stage == "B2":
-        return F_true_conditional_B2(cfg, x, v, y)
-    elif cfg.second_stage == "B3":
-        return F_true_conditional_B3(cfg, x, v, y)
-    else:
-        raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
-
-
-def f_true_density_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    x = np.asarray(x)
-    v = np.asarray(v)
-    y = np.asarray(y)
-    t = norm.ppf(v)
-    e_mean = cfg.rho * t
-    sigma_y = sigmaY_of_X(x, cfg)
-    sigma_eps = np.sqrt(max(1.0 - cfg.rho ** 2, 1e-12))
-    mu_cond = cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigma_y * e_mean
-    sigma_cond = sigma_y * sigma_eps
-    return norm.pdf(y, loc=mu_cond, scale=sigma_cond)
-
-
-def f_true_density_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """
-    True conditional density f(y|x,v) for bimodal B2.
-
-    CRITICAL: This is f(y|x,v), NOT f(y|do(x)).
-    The density is a mixture of two normals with means depending on E[ε|V=v].
-    """
-    x = np.asarray(x)
-    v = np.asarray(v)
-    y = np.asarray(y)
-
-    # Conditional distribution of ε given V
-    t = norm.ppf(v)
-    e_mean = cfg.rho * t  # E[ε|V=v]
-    e_var = 1.0 - cfg.rho ** 2  # Var(ε|V=v)
-    e_std = np.sqrt(np.maximum(e_var, 1e-10))
-
-    # Component means
-    mu1 = np.sin(x) + 0.3 * x * e_mean
-    mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
-
-    # Component standard deviations (include both model noise and ε uncertainty)
-    sigma1_base = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x))
-    sigma2_base = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x))
-
-    # Total variance: model noise + contribution from ε|V variance
-    sigma1_total = np.sqrt(sigma1_base**2 + (0.3 * x)**2 * e_var)
-    sigma2_total = np.sqrt(sigma2_base**2 + (0.3 * x)**2 * e_var)
-
-    # Mixture density
-    w = cfg.b2_mixture_weight
-    pdf1 = norm.pdf(y, loc=mu1, scale=sigma1_total)
-    pdf2 = norm.pdf(y, loc=mu2, scale=sigma2_total)
-
-    return w * pdf1 + (1 - w) * pdf2
-
-
-def f_true_density_B3(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    """
-    True conditional density f(y|x,v) for latent-factor B3 specification.
-
-    Under A3/B3, Y|x,v is normal with variance 11/2 and mean x - (3/√2) Φ^{-1}(v).
-    """
-    x = np.asarray(x, dtype=float)
-    v = np.asarray(v, dtype=float)
-    y = np.asarray(y, dtype=float)
-
-    t = norm.ppf(v)
-    mean = x - (3.0 / np.sqrt(2.0)) * t
-    std = np.sqrt(11.0 / 2.0)
-    return norm.pdf(y, loc=mean, scale=std)
-
-
-def f_true_density(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
-    if cfg.second_stage == "B1":
-        return f_true_density_B1(cfg, x, v, y)
-    elif cfg.second_stage == "B2":
-        return f_true_density_B2(cfg, x, v, y)
-    elif cfg.second_stage == "B3":
-        return f_true_density_B3(cfg, x, v, y)
-    else:
-        raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
-
-
 def sample_eps_marginal(n_samples: int, rng: np.random.Generator) -> np.ndarray:
     """
     Sample ε from its marginal distribution.
@@ -895,6 +742,17 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         if h_arr.shape != eps_arr.shape:
             raise ValueError("Shape mismatch between eps_draws and h_draws for B3.")
         return x_arr - 3.0 * h_arr + eps_arr
+    elif cfg.second_stage == "B4":
+        if h_draws is None:
+            raise ValueError("B4 simulation requires latent H draws.")
+        h_arr = np.asarray(h_draws, dtype=float)
+        if h_arr.shape != eps_arr.shape:
+            raise ValueError("Shape mismatch between eps_draws and h_draws for B4.")
+        linear_branch = 0.2 * (5.5 + 2.0 * x_arr + 3.0 * h_arr + eps_arr)
+        softplus_arg = (2.0 * x_arr + h_arr) ** 2 + eps_arr
+        safe_arg = np.maximum(softplus_arg, B4_SOFTPLUS_EPS)
+        softplus_branch = np.log(safe_arg)
+        return np.where(x_arr <= 1.0, linear_branch, softplus_branch)
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -910,7 +768,7 @@ def monte_carlo_y_given_x(cfg: DGPConfig,
 
     Previous versions sampled ε | η; that path is retained in comments for reference.
     """
-    if cfg.second_stage == "B3":
+    if cfg.second_stage in {"B3", "B4"}:
         h_samples = rng.standard_normal(size=n_samples)
         eps_y_samples = sample_eps_marginal(n_samples, rng)
         y_samples = simulate_y_given_x_eps(cfg, x_value, eps_y_samples, h_draws=h_samples)
@@ -973,65 +831,12 @@ def compute_y_clean(cfg: DGPConfig, x: np.ndarray) -> np.ndarray:
         return w * mu1 + (1 - w) * mu2
     elif cfg.second_stage == "B3":
         return x_arr
+    elif cfg.second_stage == "B4":
+        linear_branch = 0.2 * (5.5 + 2.0 * x_arr)
+        softplus_branch = np.log((2.0 * x_arr) ** 2)
+        return np.where(x_arr <= 1.0, linear_branch, softplus_branch)
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
-
-
-def compute_true_interventional_cdf(cfg: DGPConfig,
-                                   x_grid: np.ndarray,
-                                   y_grid: np.ndarray,
-                                   n_v_points: int) -> Dict[str, np.ndarray]:
-    k_x = len(x_grid)
-    k_y = len(y_grid)
-    v_grid = create_v_integration_grid(n_v_points)
-    F_true_grid = np.zeros((k_x, k_y), dtype=float)
-
-    print(f"\nComputing TRUE interventional CDF F_true(y|do(X=x)) using numerical integration...")
-    for i, x0 in enumerate(x_grid):
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Processing x = {x0:.3f} ({i+1}/{k_x})")
-        x_vec = np.full(len(v_grid), x0, dtype=float)
-        for j, y0 in enumerate(y_grid):
-            y_vec = np.full(len(v_grid), y0, dtype=float)
-            F_vals = F_true_conditional(cfg, x_vec, v_grid, y_vec)
-            F_true_grid[i, j] = simpson(F_vals, x=v_grid)
-
-    print("✅ TRUE interventional CDF computed")
-    return {
-        "x_grid": x_grid,
-        "y_grid": y_grid,
-        "F_interventional": F_true_grid
-    }
-
-
-def compute_true_interventional_pdf(cfg: DGPConfig,
-                                    x_grid: np.ndarray,
-                                    y_grid: np.ndarray,
-                                    n_v_points: int) -> Dict[str, np.ndarray]:
-    k_x = len(x_grid)
-    k_y = len(y_grid)
-    v_grid = create_v_integration_grid(n_v_points)
-    f_true_grid = np.zeros((k_x, k_y), dtype=float)
-
-    print("\nComputing TRUE interventional PDF f_true(y|do(X=x))...")
-    for i, x0 in enumerate(x_grid):
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  Processing x = {x0:.3f} ({i+1}/{k_x})")
-        x_vec = np.full(len(v_grid), x0, dtype=float)
-        for j, y0 in enumerate(y_grid):
-            y_vec = np.full(len(v_grid), y0, dtype=float)
-            f_vals = f_true_density(cfg, x_vec, v_grid, y_vec)
-            f_true_grid[i, j] = simpson(f_vals, x=v_grid)
-
-    print("✅ TRUE interventional PDF computed")
-    rowsums = np.trapz(f_true_grid, x=y_grid, axis=1)
-    print(f"   Normalization check (∫ f_true(y) dy): min={rowsums.min():.4f}, max={rowsums.max():.4f}")
-
-    return {
-        "x_grid": x_grid,
-        "y_grid": y_grid,
-        "pdf": f_true_grid
-    }
 
 
 def create_kernel_density_plot(y_grid: np.ndarray,
@@ -1158,13 +963,7 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     mu_c_all_test = compute_mu_c_on_grid(m_model, X_test, cfg.n_v_integration_points)
     mu_c_test_estimated = mu_c_all_test[selected_idx]
 
-    print("\n[4/5] Computing interventional CDFs on test grid...", flush=True)
-    interventional_est = compute_interventional_cdf(cdf_model, x_test_grid, y_grid, cfg.n_v_integration_points)
-    interventional_true = compute_true_interventional_cdf(dgp_cfg, x_test_grid, y_grid, cfg.n_v_integration_points)
-    interventional_pdf_est = compute_interventional_pdf(cdf_model, x_test_grid, y_grid, cfg.n_v_integration_points)
-    interventional_pdf_true = compute_true_interventional_pdf(dgp_cfg, x_test_grid, y_grid, cfg.n_v_integration_points)
-
-    print("\n[5/5] Preparing outputs...", flush=True)
+    print("\n[4/5] Preparing outputs...", flush=True)
 
     kde_indices = select_kde_indices(len(x_test_grid), cfg.kde_quantiles)
     kde_x_values = x_test_grid[kde_indices]
@@ -1246,14 +1045,6 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
             "y_test_grid": y_test_grid,
             "estimated": mu_c_estimated,
         },
-        "interventional_cdf": {
-            "estimated": interventional_est,
-            "true": interventional_true
-        },
-        "interventional_pdf": {
-            "estimated": interventional_pdf_est,
-            "true": interventional_pdf_true
-        },
         "predictions": {
             "Z": Z_subset,
             "X": X_test_subset,
@@ -1324,48 +1115,6 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
     predictions_df.to_csv(predictions_csv, index=False)
     print(f"✅ Predictions saved to: {predictions_csv}")
     artifact_names.append(os.path.basename(predictions_csv))
-
-    # Interventional CDF CSV (long format)
-    interventional_est = results["interventional_cdf"]["estimated"]
-    interventional_true = results["interventional_cdf"]["true"]
-    x_grid = interventional_est["x_grid"]
-    y_grid = interventional_est["y_grid"]
-    F_est = interventional_est["F_interventional"]
-    F_true = interventional_true["F_interventional"]
-
-    rows = []
-    for i, x_val in enumerate(x_grid):
-        for j, y_val in enumerate(y_grid):
-            rows.append({
-                "x_value": x_val,
-                "y_value": y_val,
-                "F_estimated": F_est[i, j],
-                "F_true": F_true[i, j]
-            })
-    interventional_csv = os.path.join(output_dir, f"iv_stage2_9_{codes}_interventional_cdf_{timestamp}.csv")
-    pd.DataFrame(rows).to_csv(interventional_csv, index=False)
-    print(f"✅ Interventional CDF saved to: {interventional_csv}")
-    artifact_names.append(os.path.basename(interventional_csv))
-
-    # Interventional PDF CSV (long format)
-    pdf_est = results["interventional_pdf"]["estimated"]
-    pdf_true = results["interventional_pdf"]["true"]
-    pdf_rows = []
-    pdf_y_grid = pdf_est["y_grid"]
-    pdf_est_values = pdf_est["pdf"]
-    pdf_true_values = pdf_true["pdf"]
-    for i, x_val in enumerate(pdf_est["x_grid"]):
-        for j, y_val in enumerate(pdf_y_grid):
-            pdf_rows.append({
-                "x_value": x_val,
-                "y_value": y_val,
-                "pdf_estimated": pdf_est_values[i, j],
-                "pdf_true": pdf_true_values[i, j]
-            })
-    pdf_csv = os.path.join(output_dir, f"iv_stage2_9_{codes}_interventional_pdf_{timestamp}.csv")
-    pd.DataFrame(pdf_rows).to_csv(pdf_csv, index=False)
-    print(f"✅ Interventional PDF saved to: {pdf_csv}")
-    artifact_names.append(os.path.basename(pdf_csv))
 
     # Summary CSV
     summary_rows = []
