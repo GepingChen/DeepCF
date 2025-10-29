@@ -38,7 +38,7 @@ class DGPConfig:
     rho: float = 0.6                        # corr(ε, Φ^{-1}(η))
 
     # First-stage family: X = G(Z, η)
-    first_stage: Literal["A1", "A2"] = "A1"  # A1: additive location–scale; A2: monotone non-additive
+    first_stage: Literal["A1", "A2", "A3"] = "A1"  # A1: additive location–scale; A2: monotone non-additive; A3: additive with latent H
     alpha0: float = 0.0
     alpha1: float = 1.0
     gamma0: float = -0.2
@@ -46,7 +46,7 @@ class DGPConfig:
     a2_h: Literal["exp", "cubic"] = "exp"   # A2 transform
 
     # Second-stage family: Y = H(X, ε)
-    second_stage: Literal["B1", "B2"] = "B1"
+    second_stage: Literal["B1", "B2", "B3"] = "B1"
     beta1: float = 1.0
     beta2: float = 0.5
     delta0: float = -0.5                    # σ_Y(V) = exp(δ0 + δ1 V)
@@ -112,7 +112,6 @@ def simulate_eps_eta(n: int, rho: float) -> Tuple[np.ndarray, np.ndarray]:
     cov = np.array([[1.0, rho], [rho, 1.0]])
     L = np.linalg.cholesky(cov)
     Z0 = np.random.randn(2, n)
-    #Z0 = np.random.uniform(0, 3, (2, n))
     E, T = L @ Z0
     eps = E
     eta = norm.cdf(T)  # in (0,1)
@@ -191,7 +190,14 @@ def simulate_first_stage(cfg: DGPConfig, Z: np.ndarray, eta: np.ndarray) -> Tupl
     return X, V_true
 
 
-def simulate_second_stage(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps: np.ndarray) -> np.ndarray:
+def simulate_second_stage(
+    cfg: DGPConfig,
+    X: np.ndarray,
+    V_true: np.ndarray,
+    eps: np.ndarray,
+    *,
+    latent_h: np.ndarray | None = None,
+) -> np.ndarray:
     """
     Generate Y = H(X, ε) according to second-stage specification.
     
@@ -215,6 +221,10 @@ def simulate_second_stage(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps
     elif cfg.second_stage == "B2":
         # B2 always uses bimodal mixture of normals
         return simulate_bimodal_y(cfg, X, V_true, eps)
+    elif cfg.second_stage == "B3":
+        if latent_h is None:
+            raise ValueError("Second-stage B3 requires latent_h draws.")
+        return X - 3.0 * latent_h + eps
     else:
         raise ValueError("Unknown second_stage")
 
@@ -239,6 +249,28 @@ def simulate_dataset(cfg: DGPConfig) -> Dict[str, np.ndarray]:
     n = cfg.n
     #Z = np.random.randn(n)
     Z = np.random.uniform(0, 3, n)
+    if cfg.first_stage == "A3":
+        if cfg.second_stage != "B3":
+            raise ValueError("First-stage 'A3' is currently only supported with second-stage 'B3'.")
+        latent_h = np.random.randn(n)
+        eps_x = np.random.randn(n)
+        eps_y = np.random.randn(n)
+        X = Z + latent_h + eps_x
+        eta = norm.cdf((X - Z) / np.sqrt(2.0))  # F_{X|Z}(X|Z) under additive normal noise
+        V_true = eta
+        Y = simulate_second_stage(cfg, X, V_true, eps_y, latent_h=latent_h)
+        return {
+            "Z": Z,
+            "X": X,
+            "Y": Y,
+            "V_true": V_true,
+            "eps": eps_y,
+            "eta": eta,
+            "H": latent_h,
+            "eps_x": eps_x,
+            "eps_y": eps_y,
+        }
+
     eps, eta = simulate_eps_eta(n, cfg.rho)
     X, V_true = simulate_first_stage(cfg, Z, eta)
     Y = simulate_second_stage(cfg, X, V_true, eps)
@@ -284,14 +316,16 @@ def training_data_generation(
         os.makedirs(train_dir, exist_ok=True)
 
         # Create DataFrame and save as CSV
-        df = pd.DataFrame({
+        base_cols = {
             'Z': data['Z'],
             'X': data['X'], 
             'Y': data['Y'],
             'V_true': data['V_true'],
             'eps': data['eps'],
             'eta': data['eta']
-        })
+        }
+        extra_cols = {k: v for k, v in data.items() if k not in base_cols}
+        df = pd.DataFrame({**base_cols, **extra_cols})
         
         # Save with DGP configuration
         csv_file = train_dir / f"train_data_{cfg.first_stage}_{cfg.second_stage}.csv"
@@ -375,14 +409,16 @@ def testdata_generation(
     
     # Save test data to CSV
     try:
-        df = pd.DataFrame({
+        base_cols = {
             'Z': test_data['Z'],
             'X': test_data['X'],
             'Y': test_data['Y'],
             'V_true': test_data['V_true'],
             'eps': test_data['eps'],
             'eta': test_data['eta']
-        })
+        }
+        extra_cols = {k: v for k, v in test_data.items() if k not in base_cols}
+        df = pd.DataFrame({**base_cols, **extra_cols})
         df.to_csv(test_data_file, index=False)
         print(f"  ✅ Test data generated and saved to: {test_data_file}")
     except Exception as e:
@@ -436,8 +472,8 @@ if __name__ == "__main__":
         n=2000,
         seed=123,
         rho=0.6,
-        first_stage="A1",
-        second_stage="B2"
+        first_stage="A3",
+        second_stage="B3"
     )
     
     # Create configuration for test data  
@@ -445,8 +481,8 @@ if __name__ == "__main__":
         n=10000,
         seed=999,
         rho=0.6,
-        first_stage="A1",
-        second_stage="B2"
+        first_stage="A3",
+        second_stage="B3"
     )
     
     print("Configuration:")

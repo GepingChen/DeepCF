@@ -725,11 +725,31 @@ def F_true_conditional_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.nd
     return w * cdf1 + (1 - w) * cdf2
 
 
+def F_true_conditional_B3(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    True conditional CDF F(y|x,v) for additive latent-factor DGP (A3/B3).
+
+    Given V = F_{X|Z}(X|Z), we recover Z and the latent sum H+ε_x, yielding
+    H | (X,V) ~ N(s/2, 1/2) with s = sqrt(2) Φ^{-1}(V). Plugging into
+    Y = X - 3H + ε_y gives a normal distribution with closed-form moments.
+    """
+    x = np.asarray(x, dtype=float)
+    v = np.asarray(v, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    t = norm.ppf(v)
+    mean = x - (3.0 / np.sqrt(2.0)) * t
+    std = np.sqrt(11.0 / 2.0)
+    return norm.cdf(y, loc=mean, scale=std)
+
+
 def F_true_conditional(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
     if cfg.second_stage == "B1":
         return F_true_conditional_B1(cfg, x, v, y)
     elif cfg.second_stage == "B2":
         return F_true_conditional_B2(cfg, x, v, y)
+    elif cfg.second_stage == "B3":
+        return F_true_conditional_B3(cfg, x, v, y)
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -784,11 +804,29 @@ def f_true_density_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarra
     return w * pdf1 + (1 - w) * pdf2
 
 
+def f_true_density_B3(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """
+    True conditional density f(y|x,v) for latent-factor B3 specification.
+
+    Under A3/B3, Y|x,v is normal with variance 11/2 and mean x - (3/√2) Φ^{-1}(v).
+    """
+    x = np.asarray(x, dtype=float)
+    v = np.asarray(v, dtype=float)
+    y = np.asarray(y, dtype=float)
+
+    t = norm.ppf(v)
+    mean = x - (3.0 / np.sqrt(2.0)) * t
+    std = np.sqrt(11.0 / 2.0)
+    return norm.pdf(y, loc=mean, scale=std)
+
+
 def f_true_density(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
     if cfg.second_stage == "B1":
         return f_true_density_B1(cfg, x, v, y)
     elif cfg.second_stage == "B2":
         return f_true_density_B2(cfg, x, v, y)
+    elif cfg.second_stage == "B3":
+        return f_true_density_B3(cfg, x, v, y)
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -805,7 +843,9 @@ def sample_eps_marginal(n_samples: int, rng: np.random.Generator) -> np.ndarray:
 
 def simulate_y_given_x_eps(cfg: DGPConfig,
                            x_value: float,
-                           eps_draws: np.ndarray) -> np.ndarray:
+                           eps_draws: np.ndarray,
+                           *,
+                           h_draws: np.ndarray | None = None) -> np.ndarray:
     """
     Evaluate Y given X=x and sampled ε draws.
 
@@ -833,6 +873,13 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         y2 = mu2 + sigma2 * np.random.randn(n)
 
         return mixture_indicators * y1 + (1 - mixture_indicators) * y2
+    elif cfg.second_stage == "B3":
+        if h_draws is None:
+            raise ValueError("B3 simulation requires latent H draws.")
+        h_arr = np.asarray(h_draws, dtype=float)
+        if h_arr.shape != eps_arr.shape:
+            raise ValueError("Shape mismatch between eps_draws and h_draws for B3.")
+        return x_arr - 3.0 * h_arr + eps_arr
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -848,10 +895,13 @@ def monte_carlo_y_given_x(cfg: DGPConfig,
 
     Previous versions sampled ε | η; that path is retained in comments for reference.
     """
+    if cfg.second_stage == "B3":
+        h_samples = rng.standard_normal(size=n_samples)
+        eps_y_samples = sample_eps_marginal(n_samples, rng)
+        y_samples = simulate_y_given_x_eps(cfg, x_value, eps_y_samples, h_draws=h_samples)
+        return y_samples, eps_y_samples
+
     eps_samples = sample_eps_marginal(n_samples, rng)
-    # Reference implementation (kept for clarity):
-    # eta_samples = rng.uniform(low=V_EPSILON, high=1.0 - V_EPSILON, size=n_samples)
-    # eps_samples = sample_eps_given_eta(cfg, eta_samples, rng)
     y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples)
     return y_samples, eps_samples
 
@@ -906,6 +956,8 @@ def compute_y_clean(cfg: DGPConfig, x: np.ndarray) -> np.ndarray:
         mu1 = np.sin(x_arr)
         mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation
         return w * mu1 + (1 - w) * mu2
+    elif cfg.second_stage == "B3":
+        return x_arr
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
 
@@ -1366,8 +1418,8 @@ if __name__ == "__main__":
         n_y_grid=100,
         n_v_integration_points=100,
         use_tabpfn=True,
-        first_stage_code="A1",
-        second_stage_code="B2",
+        first_stage_code="A3",
+        second_stage_code="B3",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
         kde_sample_size=1000
     )
