@@ -341,9 +341,10 @@ def select_kde_indices(n_points: int, quantiles: Tuple[float, ...]) -> np.ndarra
 # =========================================================
 # 2) Integrated Structural Function on Test Grid: μ_c(x)
 # =========================================================
-def compute_mu_c_on_grid(m_model: StructuralFunctionModel, 
-                         x_grid: np.ndarray, 
-                         n_v_points: int) -> np.ndarray:
+def compute_mu_c_on_grid(m_model: StructuralFunctionModel,
+                         x_grid: np.ndarray,
+                         n_v_points: int,
+                         max_points_per_batch: int | None = None) -> np.ndarray:
     """
     Compute μ_c(x) = ∫₀¹ m̂(x,v) dv using numerical integration.
     
@@ -367,19 +368,33 @@ def compute_mu_c_on_grid(m_model: StructuralFunctionModel,
         f"{k} x values × {n_v} V points (vectorized TabPFN inference)..."
     )
 
-    # Build the joint (x, v) feature grid once and reuse TabPFN batching.
-    x_col = np.repeat(x_grid, n_v).astype(float)
-    v_col = np.tile(v_grid, k).astype(float)
+    if max_points_per_batch is None:
+        target_products = 20000  # heuristic limit to keep GPU memory manageable
+        if k * n_v <= target_products:
+            max_points_per_batch = k
+        else:
+            max_points_per_batch = max(1, target_products // n_v)
+    else:
+        max_points_per_batch = max(1, int(max_points_per_batch))
 
-    m_vals = np.asarray(m_model.predict(x_col, v_col), dtype=float)
-    if m_vals.size != k * n_v:
-        raise ValueError(
-            f"Unexpected structural predictions shape {m_vals.shape}; "
-            f"expected {k * n_v} entries for the X×V grid."
-        )
+    mu_c_grid = np.empty(k, dtype=float)
 
-    m_matrix = m_vals.reshape(k, n_v)
-    mu_c_grid = simpson(m_matrix, x=v_grid, axis=1)
+    for start in range(0, k, max_points_per_batch):
+        end = min(start + max_points_per_batch, k)
+        x_chunk = np.asarray(x_grid[start:end], dtype=float)
+        repeat_count = len(x_chunk)
+        x_col = np.repeat(x_chunk, n_v).astype(float)
+        v_col = np.tile(v_grid, repeat_count).astype(float)
+
+        m_vals = np.asarray(m_model.predict(x_col, v_col), dtype=float)
+        if m_vals.size != repeat_count * n_v:
+            raise ValueError(
+                f"Unexpected structural predictions shape {m_vals.shape}; "
+                f"expected {repeat_count * n_v} entries for the X×V grid."
+            )
+
+        m_matrix = m_vals.reshape(repeat_count, n_v)
+        mu_c_grid[start:end] = simpson(m_matrix, x=v_grid, axis=1)
 
     print(f"✅ μ_c computed on test grid: mean={np.mean(mu_c_grid):.4f}, std={np.std(mu_c_grid):.4f}")
     return mu_c_grid
