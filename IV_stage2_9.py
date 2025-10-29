@@ -109,6 +109,42 @@ def load_stage1_data(csv_path: str) -> Dict[str, np.ndarray]:
     return data
 
 
+def load_dgp_test_data(first_stage: str, second_stage: str, base_dir: str = "IV_datasets") -> Tuple[str, Dict[str, Optional[np.ndarray]]]:
+    """
+    Load immutable DGP test split from IV_datasets directory.
+
+    Returns the resolved CSV path along with column arrays needed downstream.
+    """
+    test_file = os.path.join(base_dir, "test", f"test_data_{first_stage}_{second_stage}.csv")
+    if not os.path.exists(test_file):
+        raise FileNotFoundError(
+            f"DGP test data not found: {test_file}\n"
+            "Please ensure the pre-generated datasets are available under IV_datasets/test."
+        )
+
+    print(f"Loading DGP test data from: {test_file}")
+    df = pd.read_csv(test_file)
+
+    required_cols = ["Z", "X", "Y", "V_true"]
+    missing = [col for col in required_cols if col not in df.columns]
+    if missing:
+        raise ValueError(
+            f"DGP test CSV is missing required columns: {missing}\n"
+            f"Available columns: {list(df.columns)}"
+        )
+
+    data: Dict[str, Optional[np.ndarray]] = {
+        "Z": df["Z"].to_numpy(),
+        "X": df["X"].to_numpy(),
+        "Y": df["Y"].to_numpy(),
+        "V_true": df["V_true"].to_numpy(),
+        "V_hat": None,
+        "eps": df["eps"].to_numpy() if "eps" in df.columns else None,
+        "eta": df["eta"].to_numpy() if "eta" in df.columns else None,
+    }
+
+    return test_file, data
+
 # =========================================================
 # Structural function model from Stage 2.1
 # =========================================================
@@ -174,6 +210,7 @@ class Stage2_9Config:
     # Input/output
     input_dir: str = "IV_datasets/stage1_output"
     output_dir: str = "IV_datasets/stage2_output"
+    dgp_base_dir: str = "IV_datasets"
     
     random_state: int = 1
     
@@ -202,19 +239,19 @@ def prepare_stage2_components(cfg: Stage2_9Config):
     """
     codes = f"{cfg.first_stage_code}_{cfg.second_stage_code}"
     train_prefix = f"iv_stage1_train_{codes}_"
-    test_prefix = f"iv_stage1_test_{codes}_"
     train_csv = _latest_matching_file(cfg.input_dir, train_prefix)
     if train_csv is None:
         raise FileNotFoundError(f"No Stage-1 training CSV found in {cfg.input_dir} matching prefix {train_prefix}")
-    test_csv = _latest_matching_file(cfg.input_dir, test_prefix)
-    if test_csv is None:
-        raise FileNotFoundError(f"No Stage-1 test CSV found in {cfg.input_dir} matching prefix {test_prefix}")
 
     print(f"Resolved Stage-1 training CSV: {train_csv}", flush=True)
-    print(f"Resolved Stage-1 test CSV: {test_csv}", flush=True)
+    test_csv, test_data = load_dgp_test_data(
+        cfg.first_stage_code,
+        cfg.second_stage_code,
+        base_dir=cfg.dgp_base_dir,
+    )
+    print(f"Resolved DGP test CSV: {test_csv}", flush=True)
 
     train_data = load_stage1_data(train_csv)
-    test_data = load_stage1_data(test_csv)
 
     dgp_cfg = DGPConfig(first_stage=cfg.first_stage_code, second_stage=cfg.second_stage_code)
 

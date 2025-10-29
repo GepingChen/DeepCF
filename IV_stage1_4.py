@@ -10,13 +10,13 @@ Key Changes from IV_stage1_3.py:
 - Load pre-generated data from IV_datasets/train and IV_datasets/test directories
 - Remove dynamic data generation functions and DGPConfig dependency
 - Accept first_stage and second_stage parameters to locate correct data files
-- Output 7-column test set: Z, X, Y, V_true, eps, eta, V_hat
+- Export 7-column training set (Z, X, Y, V_true, eps, eta, V_hat) for Stage 2 consumption
 - Save results to IV_datasets/stage1_output with DGP-aware naming
 
 The control function is the conditional CDF of X given Z, estimated via:
 - Use TabPFNRegressor to obtain the full conditional distribution of X given Z
 - Evaluate criterion-based CDF values F̂(x|z) directly (no interpolation)
-- Train on full training set, evaluate only on test set
+- Train on full training set; downstream stages source test data directly from IV_datasets/test
 - Error if TabPFN full distribution API is unavailable
 
 Reference: TabPFN_Demo_HPC.ipynb and TabPFN_Demo_Local.ipynb for proper TabPFN usage
@@ -263,7 +263,8 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
         output_dir: Directory for saving outputs
     
     Returns:
-        DataFrame with test set data: Z, X, Y, V_true, eps, eta, V_hat
+        Dict with a single key "train" containing the training DataFrame
+        augmented with V_hat.
     """
     print("Starting IV Stage 1 Experiment (Version 4)")
     print(f"DGP Configuration: first_stage={first_stage}, second_stage={second_stage}")
@@ -282,9 +283,7 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
     Z_test = test_df["Z"].values
     X_test = test_df["X"].values
     Y_test = test_df["Y"].values
-    V_test_true = test_df["V_true"].values
-    eps_test = test_df["eps"].values
-    eta_test = test_df["eta"].values
+    V_test_true = test_df["V_true"].values  # retained for diagnostics even though no predictions are generated
     
     print(f"Training data summary:")
     print(f"  Sample size: {len(Z_train)}")
@@ -297,6 +296,7 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
     print(f"  X range: [{X_test.min():.3f}, {X_test.max():.3f}]")
     print(f"  Y range: [{Y_test.min():.3f}, {Y_test.max():.3f}]")
     print(f"  Z range: [{Z_test.min():.3f}, {Z_test.max():.3f}]")
+    print(f"  V_true range: [{V_test_true.min():.3f}, {V_test_true.max():.3f}]")
 
     # --- Objective 2: Stage 1 CDF via TabPFN ---
     print(f"\n[2/3] Estimating control function V = F_{{X|Z}}(X | Z)...")
@@ -316,11 +316,6 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
     V_train_hat = cdf_model.predict(Z_train, X_train)
     print(f"V̂_train statistics: mean={np.mean(V_train_hat):.3f}, std={np.std(V_train_hat):.3f}")
 
-    # Predict on test data for downstream Stage 2 usage
-    print(f"Predicting control function on test data for Stage 2...")
-    V_test_hat = cdf_model.predict(Z_test, X_test)
-    print(f"V̂_test statistics: mean={np.mean(V_test_hat):.3f}, std={np.std(V_test_hat):.3f}")
-
     train_result_df = pd.DataFrame({
         "Z": Z_train,
         "X": X_train,
@@ -331,17 +326,7 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
         "V_hat": V_train_hat
     })
 
-    test_result_df = pd.DataFrame({
-        "Z": Z_test,
-        "X": X_test,
-        "Y": Y_test,
-        "V_true": V_test_true,
-        "eps": eps_test,
-        "eta": eta_test,
-        "V_hat": V_test_hat
-    })
-    
-    return {"train": train_result_df, "test": test_result_df}
+    return {"train": train_result_df}
 
 
 # =========================================================
