@@ -8,10 +8,10 @@ targeted at the interventional density f(y | do(X = x)).
 New in Stage 2.9:
 - Align μ_c(x) evaluation points with the held-out test samples and export the
   paired `y_test` column for the μ_c curves CSV.
-- Integrate criterion-based PDFs to recover f(y|do(X=x)) and a DGP oracle
-  counterpart on the same grid.
-- Produce a Figure-3-style kernel density visualization for three representative
-  test points, sourced from configurable X-quantiles.
+- Integrate criterion-based PDFs to recover f(y|do(X=x)) and compare with
+  analytical ground-truth curves on the same grid.
+- Produce a Figure-3-style kernel density visualization for representative test
+  points, sourced from configurable X-quantiles.
 
 Stage 2.8 foundations retained:
 - μ_c(x) via Simpson integration over TabPFN structural predictions.
@@ -44,52 +44,6 @@ try:
 except Exception as e:
     raise ImportError(f"TabPFNRegressor is required for Stage 2.9 but could not be imported: {e}")
 
-
-
-
-# =========================================================
-# 0) True Structural Function from DGP
-# =========================================================
-def m_true(cfg: DGPConfig, x: np.ndarray, v: np.ndarray) -> np.ndarray:
-    """
-    True structural function E[Y|X=x, V=v] from DGP specification.
-    
-    This is the ORACLE function - the analytical form of the true relationship
-    between X, V, and Y as specified in the data generating process.
-    
-    Args:
-        cfg: DGP configuration with parameters (beta1, beta2, rho, delta0, delta1, etc.)
-        x: (n,) array of X values
-        v: (n,) array of V values (control function)
-        
-    Returns:
-        m_true: (n,) array of true conditional means E[Y|X=x,V=v]
-    """
-    x = np.asarray(x)
-    v = np.asarray(v)
-    t = norm.ppf(v)  # Φ^{-1}(v)
-
-    if cfg.second_stage == "B1":
-        # m(x,v) = β1 x + β2 x^2 + σ_Y(x) * E[ε | V=v]
-        e_mean = cfg.rho * t
-        sigY = sigmaY_of_X(x, cfg)
-        return cfg.beta1 * x + cfg.beta2 * (x ** 2) + sigY * e_mean
-
-    elif cfg.second_stage == "B2":
-        # B2 uses bimodal mixture: E[Y|X,V] = w·μ₁ + (1-w)·μ₂
-        e_mean = cfg.rho * t
-        w = cfg.b2_mixture_weight
-        mu1 = np.sin(x) + 0.3 * x * e_mean
-        mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
-        return w * mu1 + (1 - w) * mu2
-
-    else:
-        raise ValueError("Unknown second_stage")
-
-
-# =========================================================
-# 1) Extended Configuration
-# =========================================================
 # =========================================================
 # Stage 1 data loading helper
 # =========================================================
@@ -232,15 +186,12 @@ class Stage2_9Config:
     
     # Model settings
     use_tabpfn: bool = True
-    
-    # Oracle comparison
-    include_oracle: bool = True
 
     # Density diagnostics
     kde_quantiles: Tuple[float, ...] = (0.25, 0.5, 0.75)
     kde_sample_size: int = 1000
 
-    # DGP identifiers (for file selection and oracle)
+    # DGP identifiers (for file selection)
     first_stage_code: str = "A1"
     second_stage_code: str = "B1"
 
@@ -273,11 +224,6 @@ def prepare_stage2_components(cfg: Stage2_9Config):
     cdf_model = ConditionalCDFEstimator(use_tabpfn=cfg.use_tabpfn)
     _ = cdf_model.fit_full(train_data["X"], train_data["V_hat"], train_data["Y"])
 
-    cdf_oracle = None
-    if cfg.include_oracle:
-        cdf_oracle = ConditionalCDFEstimator(use_tabpfn=cfg.use_tabpfn)
-        _ = cdf_oracle.fit_full(train_data["X"], train_data["V_true"], train_data["Y"])
-
     return {
         "codes": codes,
         "train_csv": train_csv,
@@ -287,7 +233,6 @@ def prepare_stage2_components(cfg: Stage2_9Config):
         "dgp_config": dgp_cfg,
         "m_model": m_model,
         "cdf_model": cdf_model,
-        "cdf_oracle": cdf_oracle,
     }
 
 # =========================================================
@@ -401,44 +346,6 @@ def compute_mu_c_on_grid(m_model: StructuralFunctionModel,
 
     print(f"✅ μ_c computed on test grid: mean={np.mean(mu_c_grid):.4f}, std={np.std(mu_c_grid):.4f}")
     return mu_c_grid
-
-
-def compute_mu_c_oracle_on_grid(cfg: DGPConfig, 
-                               x_grid: np.ndarray, 
-                               n_v_points: int) -> np.ndarray:
-    """
-    Compute TRUE μ_c(x) = ∫₀¹ m_true(x,v) dv using numerical integration.
-    
-    This is the oracle/ground truth for comparison using analytical integration
-    of the true structural function from the DGP.
-    
-    Args:
-        cfg: DGP configuration (for m_true parameters)
-        x_grid: (k,) array of NEW test x values
-        n_v_points: Number of V integration points
-    
-    Returns:
-        mu_c_true_grid: (k,) array of oracle μ_c values
-    """
-    k = len(x_grid)
-    v_grid = create_v_integration_grid(n_v_points)
-    mu_c_true_grid = np.zeros(k, dtype=float)
-    
-    print(f"Computing ORACLE μ_c(x) using numerical integration of true DGP formula...")
-    
-    for j, x_val in enumerate(x_grid):
-        x_vec = np.full(len(v_grid), x_val, dtype=float)
-        m_true_vals = m_true(cfg, x_vec, v_grid)  # Analytical m_true
-        
-        # Numerical integration using Simpson's rule
-        mu_c_true_grid[j] = simpson(m_true_vals, x=v_grid)
-        
-        if (j + 1) % 10 == 0:
-            print(f"  Progress: {j+1}/{k} test points completed")
-    
-    print(f"✅ Oracle μ_c computed: mean={np.mean(mu_c_true_grid):.4f}, std={np.std(mu_c_true_grid):.4f}")
-    return mu_c_true_grid
-
 
 # =========================================================
 # 3) Conditional CDF Estimation: F(y|X,V)
@@ -757,27 +664,27 @@ def F_true_conditional_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.nd
     x = np.asarray(x)
     v = np.asarray(v)
     y = np.asarray(y)
-    
+
     t = norm.ppf(v)
     e_mean = cfg.rho * t
     e_var = 1.0 - cfg.rho ** 2
     e_std = np.sqrt(np.maximum(e_var, 1e-10))
-    
+
     # Component parameters (same as density function)
     mu1 = np.sin(x) + 0.3 * x * e_mean
     mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
-    
+
     sigma1_base = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x))
     sigma2_base = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x))
-    
+
     sigma1_total = np.sqrt(sigma1_base**2 + (0.3 * x)**2 * e_var)
     sigma2_total = np.sqrt(sigma2_base**2 + (0.3 * x)**2 * e_var)
-    
+
     # Mixture CDF
     w = cfg.b2_mixture_weight
     cdf1 = norm.cdf(y, loc=mu1, scale=sigma1_total)
     cdf2 = norm.cdf(y, loc=mu2, scale=sigma2_total)
-    
+
     return w * cdf1 + (1 - w) * cdf2
 
 
@@ -788,6 +695,7 @@ def F_true_conditional(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarr
         return F_true_conditional_B2(cfg, x, v, y)
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
+
 
 def f_true_density_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
     x = np.asarray(x)
@@ -801,40 +709,41 @@ def f_true_density_B1(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarra
     sigma_cond = sigma_y * sigma_eps
     return norm.pdf(y, loc=mu_cond, scale=sigma_cond)
 
+
 def f_true_density_B2(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) -> np.ndarray:
     """
     True conditional density f(y|x,v) for bimodal B2.
-    
+
     CRITICAL: This is f(y|x,v), NOT f(y|do(x)).
     The density is a mixture of two normals with means depending on E[ε|V=v].
     """
     x = np.asarray(x)
     v = np.asarray(v)
     y = np.asarray(y)
-    
+
     # Conditional distribution of ε given V
     t = norm.ppf(v)
     e_mean = cfg.rho * t  # E[ε|V=v]
     e_var = 1.0 - cfg.rho ** 2  # Var(ε|V=v)
     e_std = np.sqrt(np.maximum(e_var, 1e-10))
-    
+
     # Component means
     mu1 = np.sin(x) + 0.3 * x * e_mean
     mu2 = np.sin(x + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x * e_mean
-    
+
     # Component standard deviations (include both model noise and ε uncertainty)
     sigma1_base = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x))
     sigma2_base = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x))
-    
+
     # Total variance: model noise + contribution from ε|V variance
     sigma1_total = np.sqrt(sigma1_base**2 + (0.3 * x)**2 * e_var)
     sigma2_total = np.sqrt(sigma2_base**2 + (0.3 * x)**2 * e_var)
-    
+
     # Mixture density
     w = cfg.b2_mixture_weight
     pdf1 = norm.pdf(y, loc=mu1, scale=sigma1_total)
     pdf2 = norm.pdf(y, loc=mu2, scale=sigma2_total)
-    
+
     return w * pdf1 + (1 - w) * pdf2
 
 
@@ -850,7 +759,7 @@ def f_true_density(cfg: DGPConfig, x: np.ndarray, v: np.ndarray, y: np.ndarray) 
 def sample_eps_marginal(n_samples: int, rng: np.random.Generator) -> np.ndarray:
     """
     Sample ε from its marginal distribution.
-    
+
     Under the joint normal construction used in the DGP, ε ~ N(0, 1).
     We keep this helper in case future DGP variants change the marginal.
     """
@@ -862,7 +771,7 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
                            eps_draws: np.ndarray) -> np.ndarray:
     """
     Evaluate Y given X=x and sampled ε draws.
-    
+
     CRITICAL: eps_draws must come from marginal N(0,1), not ε|V.
     """
     eps_arr = np.asarray(eps_draws, dtype=float)
@@ -876,16 +785,16 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         # B2 uses bimodal mixture - generate Y using marginal ε
         n = len(eps_arr)
         mixture_indicators = np.random.binomial(1, cfg.b2_mixture_weight, size=n)
-        
+
         mu1 = np.sin(x_arr) + 0.3 * x_arr * eps_arr
         mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x_arr * eps_arr
-        
+
         sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x_arr))
         sigma2 = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x_arr))
-        
+
         y1 = mu1 + sigma1 * np.random.randn(n)
         y2 = mu2 + sigma2 * np.random.randn(n)
-        
+
         return mixture_indicators * y1 + (1 - mixture_indicators) * y2
     else:
         raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
@@ -1094,7 +1003,7 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
       2. Fit structural model m(x, v) on full data
       3. Integrate out V to obtain μ_c(x) on grids and at each test observation
       4. Fit conditional CDF models on full data
-      5. Compute interventional CDF/PDF diagnostics (estimated/oracle/true)
+      5. Compute interventional CDF/PDF diagnostics (estimated vs. analytical ground truth)
     """
     import sys
 
@@ -1111,10 +1020,8 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     dgp_cfg = components["dgp_config"]
     m_model = components["m_model"]
     cdf_model = components["cdf_model"]
-    cdf_oracle = components["cdf_oracle"]
     X_test = test_data["X"]
     Y_test = test_data["Y"]
-    V_hat_test = test_data["V_hat"]
     V_true_test = test_data["V_true"]
     n_train = len(train_data["X"])
     n_test = len(X_test)
@@ -1132,29 +1039,20 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     print(f"  Y grid: {cfg.n_y_grid} points from {y_min:.3f} to {y_max:.3f}", flush=True)
 
     mu_c_estimated = compute_mu_c_on_grid(m_model, x_test_grid, cfg.n_v_integration_points)
-    mu_c_oracle = None
-    if cfg.include_oracle:
-        mu_c_oracle = compute_mu_c_oracle_on_grid(dgp_cfg, x_test_grid, cfg.n_v_integration_points)
 
     Z_subset = None if test_data["Z"] is None else test_data["Z"][selected_idx]
     X_test_subset = X_test[selected_idx]
     Y_test_subset = Y_test[selected_idx]
     Y_clean_subset = compute_y_clean(dgp_cfg, X_test_subset)
-    V_hat_subset = V_hat_test[selected_idx]
+    V_hat_subset = test_data["V_hat"][selected_idx] if test_data["V_hat"] is not None else None
     V_true_subset = V_true_test[selected_idx]
     eps_subset = None if test_data["eps"] is None else test_data["eps"][selected_idx]
     eta_subset = None if test_data["eta"] is None else test_data["eta"][selected_idx]
     print("\n[3/5] Integrating structural function for selected test observations...", flush=True)
     mu_c_test_estimated = compute_mu_c_on_grid(m_model, X_test_subset, cfg.n_v_integration_points)
-    mu_c_test_oracle = None
-    if cfg.include_oracle:
-        mu_c_test_oracle = compute_mu_c_oracle_on_grid(dgp_cfg, X_test_subset, cfg.n_v_integration_points)
 
     print("\n[4/5] Computing interventional CDFs on test grid...", flush=True)
     interventional_est = compute_interventional_cdf(cdf_model, x_test_grid, y_grid, cfg.n_v_integration_points)
-    interventional_orc = None
-    if cfg.include_oracle and cdf_oracle is not None:
-        interventional_orc = compute_interventional_cdf(cdf_oracle, x_test_grid, y_grid, cfg.n_v_integration_points)
     interventional_true = compute_true_interventional_cdf(dgp_cfg, x_test_grid, y_grid, cfg.n_v_integration_points)
     interventional_pdf_est = compute_interventional_pdf(cdf_model, x_test_grid, y_grid, cfg.n_v_integration_points)
     interventional_pdf_true = compute_true_interventional_pdf(dgp_cfg, x_test_grid, y_grid, cfg.n_v_integration_points)
@@ -1223,7 +1121,6 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
         "iae_per_x": iae_per_x,
     }
 
-    # --- Metrics ---
     mse_do_pred = float(np.mean((mu_c_test_estimated - Y_clean_subset) ** 2))
     metrics["mse_do_pred_vs_clean"] = mse_do_pred
 
@@ -1241,11 +1138,9 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
             "x_test_grid": x_test_grid,
             "y_test_grid": y_test_grid,
             "estimated": mu_c_estimated,
-            "oracle": mu_c_oracle
         },
         "interventional_cdf": {
             "estimated": interventional_est,
-            "oracle": interventional_orc,
             "true": interventional_true
         },
         "interventional_pdf": {
@@ -1257,7 +1152,6 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
             "X": X_test_subset,
             "Y_true": Y_test_subset,
             "Y_do_pred": mu_c_test_estimated,
-            "Y_do_oracle": mu_c_test_oracle,
             "Y_clean": Y_clean_subset,
             "V_hat": V_hat_subset,
             "V_true": V_true_subset,
@@ -1313,9 +1207,6 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
         ("Y_do_pred", pred["Y_do_pred"]),
     ])
 
-    if pred.get("Y_do_oracle") is not None:
-        pred_columns.append(("Y_do_oracle", pred["Y_do_oracle"]))
-
     for optional_key in ("V_hat", "V_true", "eps", "eta"):
         value = pred.get(optional_key)
         if value is not None:
@@ -1329,12 +1220,10 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
 
     # Interventional CDF CSV (long format)
     interventional_est = results["interventional_cdf"]["estimated"]
-    interventional_orc = results["interventional_cdf"]["oracle"]
     interventional_true = results["interventional_cdf"]["true"]
     x_grid = interventional_est["x_grid"]
     y_grid = interventional_est["y_grid"]
     F_est = interventional_est["F_interventional"]
-    F_orc = interventional_orc["F_interventional"] if interventional_orc else None
     F_true = interventional_true["F_interventional"]
 
     rows = []
@@ -1344,7 +1233,6 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
                 "x_value": x_val,
                 "y_value": y_val,
                 "F_estimated": F_est[i, j],
-                "F_oracle": F_orc[i, j] if F_orc is not None else np.nan,
                 "F_true": F_true[i, j]
             })
     interventional_csv = os.path.join(output_dir, f"iv_stage2_9_{codes}_interventional_cdf_{timestamp}.csv")
@@ -1441,7 +1329,6 @@ if __name__ == "__main__":
         n_y_grid=100,
         n_v_integration_points=100,
         use_tabpfn=True,
-        include_oracle=True,
         first_stage_code="A1",
         second_stage_code="B2",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
