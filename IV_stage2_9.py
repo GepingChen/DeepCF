@@ -1132,13 +1132,16 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     Z_subset = None if test_data["Z"] is None else test_data["Z"][selected_idx]
     X_test_subset = X_test[selected_idx]
     Y_test_subset = Y_test[selected_idx]
-    Y_clean_subset = compute_y_clean(dgp_cfg, X_test_subset)
+    Y_clean_full = compute_y_clean(dgp_cfg, X_test)
+    Y_clean_subset = Y_clean_full[selected_idx]
     V_hat_subset = test_data["V_hat"][selected_idx] if test_data["V_hat"] is not None else None
     V_true_subset = V_true_test[selected_idx]
     eps_subset = None if test_data["eps"] is None else test_data["eps"][selected_idx]
     eta_subset = None if test_data["eta"] is None else test_data["eta"][selected_idx]
     print("\n[3/5] Integrating structural function for selected test observations...", flush=True)
-    mu_c_test_estimated = compute_mu_c_on_grid(m_model, X_test_subset, cfg.n_v_integration_points)
+    # Full-test integration used for global diagnostics (e.g., MSE over all test points)
+    mu_c_all_test = compute_mu_c_on_grid(m_model, X_test, cfg.n_v_integration_points)
+    mu_c_test_estimated = mu_c_all_test[selected_idx]
 
     print("\n[4/5] Computing interventional CDFs on test grid...", flush=True)
     interventional_est = compute_interventional_cdf(cdf_model, x_test_grid, y_grid, cfg.n_v_integration_points)
@@ -1210,7 +1213,7 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
         "iae_per_x": iae_per_x,
     }
 
-    mse_do_pred = float(np.mean((mu_c_test_estimated - Y_clean_subset) ** 2))
+    mse_do_pred = float(np.mean((mu_c_all_test - Y_clean_full) ** 2))
     metrics["mse_do_pred_vs_clean"] = mse_do_pred
 
     return {
