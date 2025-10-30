@@ -237,7 +237,7 @@ def simulate_second_stage(
 
         linear_branch = 0.2 * (5.5 + 2.0 * X + 3.0 * h_arr + eps_arr)
         # Ensure argument of log stays positive; clamp at a small epsilon.
-        softplus_arg = (2.0 * X + h_arr) ** 2 + eps_arr
+        softplus_arg = (2.0 * X + h_arr) ** 2 + eps_arr ** 2
         safe_arg = np.maximum(softplus_arg, 1e-8)
         softplus_branch = np.log(safe_arg)
         return np.where(X <= 1.0, linear_branch, softplus_branch)

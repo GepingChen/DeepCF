@@ -233,6 +233,9 @@ class Stage2_9Config:
     first_stage_code: str = "A1"
     second_stage_code: str = "B1"
 
+    # Monte Carlo estimation of y_clean
+    y_clean_mc_samples: int = 100
+
 
 def prepare_stage2_components(cfg: Stage2_9Config):
     """
@@ -707,7 +710,8 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
                            x_value: float,
                            eps_draws: np.ndarray,
                            *,
-                           h_draws: np.ndarray | None = None) -> np.ndarray:
+                           h_draws: np.ndarray | None = None,
+                           rng: np.random.Generator | None = None) -> np.ndarray:
     """
     Evaluate Y given X=x and sampled ε draws.
 
@@ -715,6 +719,7 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
     """
     eps_arr = np.asarray(eps_draws, dtype=float)
     x_arr = np.full_like(eps_arr, float(x_value), dtype=float)
+    rng = np.random.default_rng() if rng is None else rng
 
     if cfg.second_stage == "B1":
         sigma_y = sigmaY_of_X(x_arr, cfg)
@@ -723,7 +728,7 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
     elif cfg.second_stage == "B2":
         # B2 uses bimodal mixture - generate Y using marginal ε
         n = len(eps_arr)
-        mixture_indicators = np.random.binomial(1, cfg.b2_mixture_weight, size=n)
+        mixture_indicators = rng.binomial(1, cfg.b2_mixture_weight, size=n)
 
         mu1 = np.sin(x_arr) + 0.3 * x_arr * eps_arr
         mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x_arr * eps_arr
@@ -731,8 +736,8 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x_arr))
         sigma2 = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x_arr))
 
-        y1 = mu1 + sigma1 * np.random.randn(n)
-        y2 = mu2 + sigma2 * np.random.randn(n)
+        y1 = mu1 + sigma1 * rng.standard_normal(n)
+        y2 = mu2 + sigma2 * rng.standard_normal(n)
 
         return mixture_indicators * y1 + (1 - mixture_indicators) * y2
     elif cfg.second_stage == "B3":
@@ -778,11 +783,11 @@ def monte_carlo_y_given_x(cfg: DGPConfig,
     if cfg.second_stage in {"B3", "B4", "B5"}:
         h_samples = rng.standard_normal(size=n_samples)
         eps_y_samples = sample_eps_marginal(n_samples, rng)
-        y_samples = simulate_y_given_x_eps(cfg, x_value, eps_y_samples, h_draws=h_samples)
+        y_samples = simulate_y_given_x_eps(cfg, x_value, eps_y_samples, h_draws=h_samples, rng=rng)
         return y_samples, eps_y_samples
 
     eps_samples = sample_eps_marginal(n_samples, rng)
-    y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples)
+    y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples, rng=rng)
     return y_samples, eps_samples
 
 
@@ -825,27 +830,48 @@ def sample_tabpfn_y_given_x(cdf_model: ConditionalCDFEstimator,
     return y_samples, v_samples, u_samples
 
 
-def compute_y_clean(cfg: DGPConfig, x: np.ndarray) -> np.ndarray:
-    """Deterministic component of Y under the DGP (noise removed)."""
-    x_arr = np.asarray(x, dtype=float)
-    if cfg.second_stage == "B1":
-        return cfg.beta1 * x_arr + cfg.beta2 * (x_arr ** 2)
-    elif cfg.second_stage == "B2":
-        # B2 uses bimodal mixture: weighted mean with E[ε]=0
-        w = cfg.b2_mixture_weight
-        mu1 = np.sin(x_arr)
-        mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation
-        return w * mu1 + (1 - w) * mu2
-    elif cfg.second_stage == "B3":
-        return x_arr
-    elif cfg.second_stage == "B4":
-        linear_branch = 0.2 * (5.5 + 2.0 * x_arr)
-        softplus_branch = np.log((2.0 * x_arr) ** 2)
-        return np.where(x_arr <= 1.0, linear_branch, softplus_branch)
-    elif cfg.second_stage == "B5":
-        return 3.0 * np.sin(2.0 * x_arr) + 2.0 * x_arr
+def compute_y_clean(cfg: DGPConfig,
+                    x: np.ndarray,
+                    n_samples: int = 100,
+                    rng: np.random.Generator | None = None,
+                    return_samples: bool = False):
+    """
+    Monte Carlo estimate of the structural expectation y_clean(x) = E_ε[m(x, ε)].
+
+    For each x_j we draw ε_{j1}, ..., ε_{jM} ~ p(ε) (default M=100) and evaluate the
+    structural model to obtain samples y_{jk} = m(x_j, ε_{jk}). We approximate
+    E_ε[m(x_j, ε)] with the sample mean (1/M) sum_{k=1}^M y_{jk}. The same draws are
+    later reused for diagnostics, so that per-point squared errors accumulate as
+    sum_{k=1}^M (y_{jk} - y_pred_j)^2 and the global MSE diagnostic becomes
+    sum_{j=1}^{n_test} sum_{k=1}^M (y_{jk} - y_pred_j)^2.
+    """
+    if n_samples <= 0:
+        raise ValueError("n_samples must be positive when estimating y_clean.")
+
+    rng = np.random.default_rng() if rng is None else rng
+    x_raw = np.asarray(x, dtype=float)
+    was_scalar = x_raw.ndim == 0
+    x_arr = np.atleast_1d(x_raw).astype(float)
+
+    n_x = x_arr.size
+    samples = np.empty((n_x, n_samples), dtype=float)
+
+    for idx, x_val in enumerate(x_arr):
+        y_draws, _ = monte_carlo_y_given_x(cfg, float(x_val), n_samples, rng)
+        samples[idx, :] = y_draws
+
+    means = samples.mean(axis=1)
+
+    if was_scalar:
+        means_out = float(means[0])
+        samples_out = samples[0]
     else:
-        raise ValueError(f"Unknown second_stage: {cfg.second_stage}")
+        means_out = means
+        samples_out = samples
+
+    if return_samples:
+        return means_out, samples_out
+    return means_out
 
 
 def create_kernel_density_plot(y_grid: np.ndarray,
@@ -961,7 +987,13 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     Z_subset = None if test_data["Z"] is None else test_data["Z"][selected_idx]
     X_test_subset = X_test[selected_idx]
     Y_test_subset = Y_test[selected_idx]
-    Y_clean_full = compute_y_clean(dgp_cfg, X_test)
+    Y_clean_full, y_clean_samples_full = compute_y_clean(
+        dgp_cfg,
+        X_test,
+        n_samples=cfg.y_clean_mc_samples,
+        rng=rng,
+        return_samples=True,
+    )
     Y_clean_subset = Y_clean_full[selected_idx]
     V_hat_subset = test_data["V_hat"][selected_idx] if test_data["V_hat"] is not None else None
     V_true_subset = V_true_test[selected_idx]
@@ -1034,10 +1066,15 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
         "iae_mean": float(np.mean(iae_per_x)),
         "iae_max": float(np.max(iae_per_x)),
         "iae_per_x": iae_per_x,
+        "y_clean_mc_samples": cfg.y_clean_mc_samples,
     }
 
-    mse_do_pred = float(np.mean((mu_c_all_test - Y_clean_full) ** 2))
-    metrics["mse_do_pred_vs_clean"] = mse_do_pred
+    # Reuse the Monte Carlo draws to accumulate squared errors against the predictor.
+    squared_error_matrix = (y_clean_samples_full - mu_c_all_test[:, None]) ** 2
+    squared_error_sum_per_x = np.sum(squared_error_matrix, axis=1)
+    squared_error_mean_per_x = squared_error_sum_per_x / cfg.y_clean_mc_samples
+    metrics["mse_do_pred_vs_clean"] = float(np.mean(squared_error_mean_per_x))
+    metrics["mse_mean_per_x"] = squared_error_mean_per_x
 
     return {
         "config": asdict(cfg),
@@ -1141,6 +1178,9 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
         summary_rows.append({"key": "metric_iae_max", "value": f"{metrics['iae_max']:.6f}"})
         iae_series = ";".join(f"{val:.6f}" for val in metrics['iae_per_x'])
         summary_rows.append({"key": "metric_iae_per_x", "value": iae_series})
+        se_series = ";".join(f"{val:.6f}" for val in metrics["mse_mean_per_x"])
+        summary_rows.append({"key": "metric_mse_mean_per_x", "value": se_series})
+        summary_rows.append({"key": "metric_y_clean_mc_samples", "value": str(metrics["y_clean_mc_samples"])})
 
     kde = results.get("kde")
     if kde is not None:
@@ -1192,12 +1232,13 @@ if __name__ == "__main__":
         random_state=1,
         n_x_test=50,
         n_y_grid=100,
-        n_v_integration_points=100,
+        n_v_integration_points=200,
         use_tabpfn=True,
         first_stage_code="A3",
         second_stage_code="B5",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
-        kde_sample_size=1000
+        kde_sample_size=1000,
+        y_clean_mc_samples=100
     )
 
     print(f"Configuration: {cfg}", flush=True)
