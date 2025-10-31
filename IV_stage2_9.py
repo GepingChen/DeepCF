@@ -212,11 +212,11 @@ class Stage2_9Config:
     input_dir: str = "IV_datasets/stage1_output"
     output_dir: str = "IV_datasets/stage2_output"
     dgp_base_dir: str = "IV_datasets"
+    n_train_samples: Optional[int] = None
     
     random_state: int = 1
     
     # Test grids (uniform grids)
-    n_x_test: int = 50      # Number of test X points (uniform grid)
     n_y_grid: int = 100     # Number of Y points for CDF evaluation
     
     # V integration grid (NEW: numerical integration)
@@ -242,7 +242,8 @@ def prepare_stage2_components(cfg: Stage2_9Config):
     Load Stage 1 outputs, train Stage 2 models, and return reusable components.
     """
     codes = f"{cfg.first_stage_code}_{cfg.second_stage_code}"
-    train_prefix = f"iv_stage1_train_{codes}_"
+    sample_tag = f"_{cfg.n_train_samples}" if cfg.n_train_samples is not None else ""
+    train_prefix = f"iv_stage1_train_{codes}{sample_tag}_"
     train_csv = _latest_matching_file(cfg.input_dir, train_prefix)
     if train_csv is None:
         raise FileNotFoundError(f"No Stage-1 training CSV found in {cfg.input_dir} matching prefix {train_prefix}")
@@ -256,6 +257,12 @@ def prepare_stage2_components(cfg: Stage2_9Config):
     print(f"Resolved DGP test CSV: {test_csv}", flush=True)
 
     train_data = load_stage1_data(train_csv)
+    observed_train_samples = len(train_data["X"])
+    if cfg.n_train_samples is not None and observed_train_samples != cfg.n_train_samples:
+        raise ValueError(
+            f"Resolved Stage-1 CSV ({train_csv}) has {observed_train_samples} rows; "
+            f"expected {cfg.n_train_samples}."
+        )
 
     dgp_cfg = DGPConfig(first_stage=cfg.first_stage_code, second_stage=cfg.second_stage_code)
 
@@ -274,6 +281,7 @@ def prepare_stage2_components(cfg: Stage2_9Config):
         "dgp_config": dgp_cfg,
         "m_model": m_model,
         "cdf_model": cdf_model,
+        "n_train_samples": observed_train_samples,
     }
 
 # =========================================================
@@ -293,33 +301,6 @@ def create_v_integration_grid(n_points: int = 100) -> np.ndarray:
     if n_points % 2 == 0:
         n_points += 1  # Simpson needs odd number
     return np.linspace(V_EPSILON, 1.0 - V_EPSILON, n_points)
-
-
-def build_test_grid(
-    X_test: np.ndarray,
-    Y_test: np.ndarray,
-    desired_points: int,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Align the evaluation grid with observed test samples and record indices.
-
-    Returns the X grid sorted in ascending order alongside the matching Y
-    observations and the corresponding indices back into the original test
-    arrays. If the test split has more points than requested, we pick evenly
-    spaced indices to respect the requested resolution.
-    """
-    X_test = np.asarray(X_test, dtype=float)
-    Y_test = np.asarray(Y_test, dtype=float)
-    sort_idx = np.argsort(X_test)
-    X_sorted = X_test[sort_idx]
-    Y_sorted = Y_test[sort_idx]
-
-    n_available = len(X_sorted)
-    if desired_points is None or desired_points <= 0 or desired_points >= n_available:
-        return X_sorted, Y_sorted, sort_idx
-
-    pick_idx = np.linspace(0, n_available - 1, desired_points).round().astype(int)
-    pick_idx = np.clip(pick_idx, 0, n_available - 1)
-    return X_sorted[pick_idx], Y_sorted[pick_idx], sort_idx[pick_idx]
 
 
 def select_kde_indices(n_points: int, quantiles: Tuple[float, ...]) -> np.ndarray:
@@ -966,43 +947,35 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     cdf_model = components["cdf_model"]
     X_test = test_data["X"]
     Y_test = test_data["Y"]
-    V_true_test = test_data["V_true"]
+    sort_idx = np.argsort(X_test)
+    x_test_grid = X_test[sort_idx]
+    y_test_grid = Y_test[sort_idx]
     n_train = len(train_data["X"])
     n_test = len(X_test)
 
     print(f"\n[1/5] Components prepared: train={n_train} samples, test={n_test} samples", flush=True)
 
     print("\n[2/5] Aligning evaluation grid with held-out test samples...", flush=True)
-    x_test_grid, y_test_grid, selected_idx = build_test_grid(X_test, Y_test, cfg.n_x_test)
-    selected_idx = np.asarray(selected_idx, dtype=int)
     k_x = len(x_test_grid)
     x_min, x_max = float(np.min(x_test_grid)), float(np.max(x_test_grid))
     y_min, y_max = float(np.min(Y_test)), float(np.max(Y_test))
     y_grid = np.linspace(y_min, y_max, cfg.n_y_grid)
-    print(f"  X grid: {k_x} test points from {x_min:.3f} to {x_max:.3f}", flush=True)
+    print(f"  X grid: {k_x} test points (full test set) from {x_min:.3f} to {x_max:.3f}", flush=True)
     print(f"  Y grid: {cfg.n_y_grid} points from {y_min:.3f} to {y_max:.3f}", flush=True)
 
-    mu_c_estimated = compute_mu_c_on_grid(m_model, x_test_grid, cfg.n_v_integration_points)
+    mu_c_sorted = compute_mu_c_on_grid(m_model, x_test_grid, cfg.n_v_integration_points)
+    mu_c_all_test = np.empty_like(X_test, dtype=float)
+    mu_c_all_test[sort_idx] = mu_c_sorted
 
-    Z_subset = None if test_data["Z"] is None else test_data["Z"][selected_idx]
-    X_test_subset = X_test[selected_idx]
-    Y_test_subset = Y_test[selected_idx]
-    Y_clean_full, y_clean_samples_full = compute_y_clean(
+    print("\n[3/5] Computing ground-truth expectations for full test set...", flush=True)
+    Y_clean_full = compute_y_clean(
         dgp_cfg,
         X_test,
         n_samples=cfg.y_clean_mc_samples,
         rng=rng,
-        return_samples=True,
+        return_samples=False,
     )
-    Y_clean_subset = Y_clean_full[selected_idx]
-    V_hat_subset = test_data["V_hat"][selected_idx] if test_data["V_hat"] is not None else None
-    V_true_subset = V_true_test[selected_idx]
-    eps_subset = None if test_data["eps"] is None else test_data["eps"][selected_idx]
-    eta_subset = None if test_data["eta"] is None else test_data["eta"][selected_idx]
-    print("\n[3/5] Integrating structural function for selected test observations...", flush=True)
-    # Full-test integration used for global diagnostics (e.g., MSE over all test points)
-    mu_c_all_test = compute_mu_c_on_grid(m_model, X_test, cfg.n_v_integration_points)
-    mu_c_test_estimated = mu_c_all_test[selected_idx]
+    Y_clean_sorted = Y_clean_full[sort_idx]
 
     print("\n[4/5] Preparing outputs...", flush=True)
 
@@ -1075,32 +1048,32 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
     metrics["mse_do_pred_vs_clean"] = float(np.mean(squared_error_mean_per_x))
     metrics["mse_mean_per_x"] = squared_error_mean_per_x
 
+    mse_sorted = (Y_clean_sorted - mu_c_sorted) ** 2
+    # Map each sorted X to its empirical quantile strictly inside (0, 1)
+    quantile_positions = (np.arange(k_x, dtype=float) + 1.0) / (k_x + 1.0)
+    predictions_df = pd.DataFrame({
+        "X": x_test_grid,
+        "Y_clean_mean": Y_clean_sorted,
+        "Y_do_pred": mu_c_sorted,
+        "mse_per_x": mse_sorted,
+        "X_quantile": quantile_positions,
+    })
+
     return {
         "config": asdict(cfg),
         "data_stats": {
             "n_train_samples": n_train,
             "n_test_samples_raw": n_test,
             "n_test_samples_selected": k_x,
-            "n_x_test": len(x_test_grid),
             "n_y_grid": cfg.n_y_grid,
             "n_v_integration_points": cfg.n_v_integration_points
         },
         "mu_c": {
             "x_test_grid": x_test_grid,
             "y_test_grid": y_test_grid,
-            "estimated": mu_c_estimated,
+            "estimated": mu_c_sorted,
         },
-        "predictions": {
-            "Z": Z_subset,
-            "X": X_test_subset,
-            "Y_true": Y_test_subset,
-            "Y_do_pred": mu_c_test_estimated,
-            "Y_clean": Y_clean_subset,
-            "V_hat": V_hat_subset,
-            "V_true": V_true_subset,
-            "eps": eps_subset,
-            "eta": eta_subset
-        },
+        "predictions": predictions_df,
         "kde": {
             "indices": kde_indices,
             "x_values": kde_x_values,
@@ -1119,7 +1092,8 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
         "metadata": {
             "train_csv": components["train_csv"],
             "test_csv": components["test_csv"],
-            "codes": components["codes"]
+            "codes": components["codes"],
+            "n_train_samples": components["n_train_samples"],
         }
     }
 
@@ -1134,29 +1108,17 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     codes = results["metadata"]["codes"]
+    n_train_samples_meta = results["metadata"].get("n_train_samples")
+    if n_train_samples_meta is None:
+        n_train_samples_meta = results["data_stats"].get("n_train_samples")
+    sample_tag = f"_{int(n_train_samples_meta)}" if n_train_samples_meta is not None else ""
+    base_prefix = f"s2_{codes}{sample_tag}"
     artifact_names = []
 
     # Predictions CSV
-    pred = results["predictions"]
-    pred_columns: list[tuple[str, object]] = []
-
-    if pred.get("Z") is not None:
-        pred_columns.append(("Z", pred["Z"]))
-
-    pred_columns.extend([
-        ("X", pred["X"]),
-        ("Y_true", pred["Y_true"]),
-        ("Y_clean", pred["Y_clean"]),
-        ("Y_do_pred", pred["Y_do_pred"]),
-    ])
-
-    for optional_key in ("V_hat", "V_true", "eps", "eta"):
-        value = pred.get(optional_key)
-        if value is not None:
-            pred_columns.append((optional_key, value))
-
-    predictions_df = pd.DataFrame({name: data for name, data in pred_columns})
-    predictions_csv = os.path.join(output_dir, f"iv_stage2_9_{codes}_predictions_{timestamp}.csv")
+    predictions_df = results["predictions"].copy()
+    predictions_df = predictions_df.sort_values("X").reset_index(drop=True)
+    predictions_csv = os.path.join(output_dir, f"{base_prefix}_predictions_{timestamp}.csv")
     predictions_df.to_csv(predictions_csv, index=False)
     print(f"✅ Predictions saved to: {predictions_csv}")
     artifact_names.append(os.path.basename(predictions_csv))
@@ -1185,14 +1147,14 @@ def save_stage2_9_results(results: Dict[str, object], output_dir: str):
     if kde is not None:
         x_summary = ";".join(f"{val:.4f}" for val in kde["x_values"])
         summary_rows.append({"key": "kde_x_values", "value": x_summary})
-    summary_csv = os.path.join(output_dir, f"iv_stage2_9_{codes}_summary_{timestamp}.csv")
+    summary_csv = os.path.join(output_dir, f"{base_prefix}_summary_{timestamp}.csv")
     pd.DataFrame(summary_rows).to_csv(summary_csv, index=False)
     print(f"✅ Summary saved to: {summary_csv}")
     artifact_names.append(os.path.basename(summary_csv))
 
     # KDE Plot
     if kde is not None:
-        kde_plot_path = os.path.join(output_dir, f"iv_stage2_9_{codes}_kde_{timestamp}.png")
+        kde_plot_path = os.path.join(output_dir, f"{base_prefix}_kde_{timestamp}.png")
         create_kernel_density_plot(
             y_grid=kde["y_grid"],
             pdf_estimated=kde["pdf_estimated"],
@@ -1229,15 +1191,15 @@ if __name__ == "__main__":
         input_dir="IV_datasets/stage1_output",
         output_dir="IV_datasets/stage2_output",
         random_state=1,
-        n_x_test=50,
         n_y_grid=100,
         n_v_integration_points=100,
         use_tabpfn=True,
         first_stage_code="A3",
-        second_stage_code="B4",
+        second_stage_code="B5",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
         kde_sample_size=1000,
-        y_clean_mc_samples=5000
+        y_clean_mc_samples=5000,
+        n_train_samples=2000,
     )
 
     print(f"Configuration: {cfg}", flush=True)
