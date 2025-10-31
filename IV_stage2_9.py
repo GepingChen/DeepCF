@@ -1069,10 +1069,9 @@ def run_stage2_9_experiment(cfg: Stage2_9Config) -> Dict[str, object]:
         "y_clean_mc_samples": cfg.y_clean_mc_samples,
     }
 
-    # Reuse the Monte Carlo draws to accumulate squared errors against the predictor.
-    squared_error_matrix = (y_clean_samples_full - mu_c_all_test[:, None]) ** 2
-    squared_error_sum_per_x = np.sum(squared_error_matrix, axis=1)
-    squared_error_mean_per_x = squared_error_sum_per_x / cfg.y_clean_mc_samples
+    # Reuse the Monte Carlo draws: compare the sample mean Ê[m(x, ε)] with μ̂_c(x).
+    # Only the averaged quantities enter the MSE, matching the structural comparison request.
+    squared_error_mean_per_x = (Y_clean_full - mu_c_all_test) ** 2
     metrics["mse_do_pred_vs_clean"] = float(np.mean(squared_error_mean_per_x))
     metrics["mse_mean_per_x"] = squared_error_mean_per_x
 
@@ -1232,13 +1231,13 @@ if __name__ == "__main__":
         random_state=1,
         n_x_test=50,
         n_y_grid=100,
-        n_v_integration_points=200,
+        n_v_integration_points=100,
         use_tabpfn=True,
         first_stage_code="A3",
-        second_stage_code="B5",
+        second_stage_code="B4",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
         kde_sample_size=1000,
-        y_clean_mc_samples=100
+        y_clean_mc_samples=5000
     )
 
     print(f"Configuration: {cfg}", flush=True)

@@ -499,7 +499,7 @@ if __name__ == "__main__":
         seed=123,
         rho=0.6,
         first_stage="A3",
-        second_stage="B5"
+        second_stage="B4"
     )
     
     # Create configuration for test data  
@@ -508,7 +508,7 @@ if __name__ == "__main__":
         seed=999,
         rho=0.6,
         first_stage="A3",
-        second_stage="B5"
+        second_stage="B4"
     )
     
     print("Configuration:")

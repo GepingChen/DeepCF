@@ -112,12 +112,19 @@ class Stage1Config:
 # =========================================================
 # 1) Data Loading Function
 # =========================================================
-def load_dgp_data(first_stage: str, second_stage: str, base_dir: str = "IV_datasets") -> Tuple[pd.DataFrame, pd.DataFrame]:
+def load_dgp_data(
+    first_stage: str,
+    second_stage: str,
+    *,
+    train_sample_size: int | None = None,
+    base_dir: str = "IV_datasets",
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     Load pre-generated training and test data from IV_datasets directory.
     
     Expected file structure:
         base_dir/train/train_data_{first_stage}_{second_stage}.csv
+        base_dir/train/train_data_{first_stage}_{second_stage}_{train_sample_size}.csv  # optional
         base_dir/test/test_data_{first_stage}_{second_stage}.csv
     
     Files must contain columns: Z, X, Y, V_true, eps, eta
@@ -125,6 +132,7 @@ def load_dgp_data(first_stage: str, second_stage: str, base_dir: str = "IV_datas
     Args:
         first_stage: First stage DGP type (e.g., "A1", "A2")
         second_stage: Second stage DGP type (e.g., "B1", "B2")
+        train_sample_size: If provided, append "_{train_sample_size}" when locating the training file
         base_dir: Base directory containing train/ and test/ subdirectories
     
     Returns:
@@ -134,7 +142,12 @@ def load_dgp_data(first_stage: str, second_stage: str, base_dir: str = "IV_datas
         FileNotFoundError: If matching files don't exist
         ValueError: If required columns are missing
     """
-    train_file = os.path.join(base_dir, "train", f"train_data_{first_stage}_{second_stage}.csv")
+    if train_sample_size is None:
+        train_filename = f"train_data_{first_stage}_{second_stage}.csv"
+    else:
+        train_filename = f"train_data_{first_stage}_{second_stage}_{train_sample_size}.csv"
+
+    train_file = os.path.join(base_dir, "train", train_filename)
     test_file = os.path.join(base_dir, "test", f"test_data_{first_stage}_{second_stage}.csv")
     
     if not os.path.exists(train_file):
@@ -159,6 +172,11 @@ def load_dgp_data(first_stage: str, second_stage: str, base_dir: str = "IV_datas
     print(f"Training data shape: {train_df.shape}")
     print(f"Test data shape: {test_df.shape}")
     
+    if train_sample_size is not None and len(train_df) != train_sample_size:
+        raise ValueError(
+            f"Training data in {train_file} has {len(train_df)} rows, expected {train_sample_size}."
+        )
+
     return train_df, test_df
 
 
@@ -249,8 +267,9 @@ class CondCDFModel:
 # =========================================================
 # 3) Main execution pipeline
 # =========================================================
-def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage1Config, 
-                         output_dir: str = "IV_datasets/stage1_output") -> Dict[str, pd.DataFrame]:
+def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage1Config,
+                          train_sample_size: int | None = None,
+                          output_dir: str = "IV_datasets/stage1_output") -> Dict[str, pd.DataFrame]:
     """
     Main pipeline implementing objectives 1 and 2:
     1) Load pre-generated triangular DGP data (training and test sets)
@@ -260,6 +279,7 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
         first_stage: First stage DGP type (e.g., "A1", "A2")
         second_stage: Second stage DGP type (e.g., "B1", "B2")
         stage1_cfg: Stage 1 estimation configuration
+        train_sample_size: Optional training sample size identifier used in the CSV filename
         output_dir: Directory for saving outputs
     
     Returns:
@@ -269,10 +289,12 @@ def run_stage1_experiment(first_stage: str, second_stage: str, stage1_cfg: Stage
     print("Starting IV Stage 1 Experiment (Version 4)")
     print(f"DGP Configuration: first_stage={first_stage}, second_stage={second_stage}")
     print(f"Stage 1 Configuration: {asdict(stage1_cfg)}")
+    if train_sample_size is not None:
+        print(f"Requested training sample size: {train_sample_size}")
     
     # --- Objective 1: Load Pre-generated Data ---
     print("\n[1/3] Loading pre-generated training data...")
-    train_df, test_df = load_dgp_data(first_stage, second_stage)
+    train_df, test_df = load_dgp_data(first_stage, second_stage, train_sample_size=train_sample_size)
     
     # Extract arrays from DataFrames
     Z_train = train_df["Z"].values
@@ -340,7 +362,10 @@ if __name__ == "__main__":
     
     # DGP parameters (default values)
     first_stage = "A3"
-    second_stage = "B5"
+    second_stage = "B4"
+
+    # Training data size identifier used in the CSV filename; set to None for legacy naming
+    train_sample_size = 4000
     
     # Stage 1 estimation configuration
     stage1_cfg = Stage1Config(
@@ -349,7 +374,7 @@ if __name__ == "__main__":
 
     # Run experiment
     try:
-        results = run_stage1_experiment(first_stage, second_stage, stage1_cfg)
+        results = run_stage1_experiment(first_stage, second_stage, stage1_cfg, train_sample_size=train_sample_size)
         
         print("\n" + "="*60)
         print("EXPERIMENT COMPLETED SUCCESSFULLY")
@@ -374,7 +399,11 @@ if __name__ == "__main__":
         
         # Save DataFrames as CSV files with DGP-aware naming
         for subset, df in results.items():
-            csv_file = os.path.join(output_dir, f"iv_stage1_{subset}_{first_stage}_{second_stage}_{timestamp}.csv")
+            sample_tag = f"_{train_sample_size}" if train_sample_size is not None else ""
+            csv_file = os.path.join(
+                output_dir,
+                f"iv_stage1_{subset}_{first_stage}_{second_stage}{sample_tag}_{timestamp}.csv",
+            )
             df.to_csv(csv_file, index=False)
             print(f"\n✅ Results saved to: {csv_file}")
         
