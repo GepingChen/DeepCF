@@ -32,7 +32,7 @@ from datetime import datetime
 import torch
 
 # Import from Stage 1
-from DGP import DGPConfig, set_seed, sigmaY_of_X
+from DGP import DGPConfig, set_seed, sigmaY_of_X, LATENT_H_WEIGHT
 
 V_EPSILON = 1e-6  # Avoid norm.ppf endpoints
 B4_SOFTPLUS_EPS = 1e-8  # Match numerical guard in DGP B4 branch
@@ -703,16 +703,26 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
     rng = np.random.default_rng() if rng is None else rng
 
     if cfg.second_stage == "B1":
+        if h_draws is None:
+            raise ValueError("B1 simulation now requires latent H draws.")
+        h_arr = np.asarray(h_draws, dtype=float)
+        if h_arr.shape != eps_arr.shape:
+            raise ValueError("Shape mismatch between eps_draws and h_draws for B1.")
         sigma_y = sigmaY_of_X(x_arr, cfg)
         m1 = cfg.beta1 * x_arr + cfg.beta2 * (x_arr ** 2)
-        return m1 + sigma_y * eps_arr
+        return m1 + sigma_y * (LATENT_H_WEIGHT * h_arr + eps_arr)
     elif cfg.second_stage == "B2":
-        # B2 uses bimodal mixture - generate Y using marginal ε
+        if h_draws is None:
+            raise ValueError("B2 simulation now requires latent H draws.")
+        # B2 uses bimodal mixture - generate Y using marginal ε and shared latent H
+        h_arr = np.asarray(h_draws, dtype=float)
+        if h_arr.shape != eps_arr.shape:
+            raise ValueError("Shape mismatch between eps_draws and h_draws for B2.")
         n = len(eps_arr)
         mixture_indicators = rng.binomial(1, cfg.b2_mixture_weight, size=n)
 
-        mu1 = np.sin(x_arr) + 0.3 * x_arr * eps_arr
-        mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x_arr * eps_arr
+        mu1 = np.sin(x_arr) + 0.3 * x_arr * h_arr
+        mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x_arr * h_arr
 
         sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x_arr))
         sigma2 = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x_arr))
@@ -735,7 +745,7 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         if h_arr.shape != eps_arr.shape:
             raise ValueError("Shape mismatch between eps_draws and h_draws for B4.")
         linear_branch = 0.2 * (5.5 + 2.0 * x_arr + 3.0 * h_arr + eps_arr)
-        softplus_arg = (2.0 * x_arr + h_arr) ** 2 + eps_arr
+        softplus_arg = (2.0 * x_arr + h_arr) ** 2 + eps_arr ** 2
         safe_arg = np.maximum(softplus_arg, B4_SOFTPLUS_EPS)
         softplus_branch = np.log(safe_arg)
         return np.where(x_arr <= 1.0, linear_branch, softplus_branch)
@@ -761,14 +771,10 @@ def monte_carlo_y_given_x(cfg: DGPConfig,
 
     Previous versions sampled ε | η; that path is retained in comments for reference.
     """
-    if cfg.second_stage in {"B3", "B4", "B5"}:
-        h_samples = rng.standard_normal(size=n_samples)
-        eps_y_samples = sample_eps_marginal(n_samples, rng)
-        y_samples = simulate_y_given_x_eps(cfg, x_value, eps_y_samples, h_draws=h_samples, rng=rng)
-        return y_samples, eps_y_samples
-
+    needs_h = cfg.second_stage in {"B1", "B2", "B3", "B4", "B5"}
+    h_samples = rng.standard_normal(size=n_samples) if needs_h else None
     eps_samples = sample_eps_marginal(n_samples, rng)
-    y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples, rng=rng)
+    y_samples = simulate_y_given_x_eps(cfg, x_value, eps_samples, h_draws=h_samples, rng=rng)
     return y_samples, eps_samples
 
 
@@ -1195,11 +1201,11 @@ if __name__ == "__main__":
         n_v_integration_points=100,
         use_tabpfn=True,
         first_stage_code="A3",
-        second_stage_code="B5",
+        second_stage_code="B4",
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
         kde_sample_size=1000,
         y_clean_mc_samples=5000,
-        n_train_samples=2000,
+        n_train_samples=8000,
     )
 
     print(f"Configuration: {cfg}", flush=True)

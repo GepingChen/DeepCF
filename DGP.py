@@ -21,10 +21,13 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 from dataclasses import dataclass, asdict, replace
-from typing import Dict, Tuple, Literal
+from typing import Dict, Tuple, Literal, Optional
 from scipy.stats import norm
 from pathlib import Path
 import os
+
+
+LATENT_H_WEIGHT = 0.6  # Shared latent-factor loading used across DGP variants
 
 
 # =========================================================
@@ -35,7 +38,7 @@ class DGPConfig:
     """Configuration for Data Generating Process"""
     n: int = 2000
     seed: int = 42
-    rho: float = 0.6                        # corr(ε, Φ^{-1}(η))
+    rho: Optional[float] = None             # Legacy parameter (unused; kept for backwards compatibility)
 
     # First-stage family: X = G(Z, η)
     first_stage: Literal["A1", "A2", "A3"] = "A1"  # A1: additive location–scale; A2: monotone non-additive; A3: additive with latent H
@@ -118,7 +121,13 @@ def simulate_eps_eta(n: int, rho: float) -> Tuple[np.ndarray, np.ndarray]:
     return eps, eta
 
 
-def simulate_bimodal_y(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps: np.ndarray) -> np.ndarray:
+def simulate_bimodal_y(
+    cfg: DGPConfig,
+    X: np.ndarray,
+    V_true: np.ndarray,
+    eps: np.ndarray,
+    latent_h: np.ndarray,
+) -> np.ndarray:
     """
     Generate Y from bimodal mixture of normals for B2-bimodal.
     
@@ -135,16 +144,19 @@ def simulate_bimodal_y(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps: n
         Y: (n,) bimodal outcomes
     """
     n = len(X)
+    h_arr = np.asarray(latent_h, dtype=float)
+    if h_arr.shape != X.shape:
+        raise ValueError("latent_h must have the same shape as X for B2.")
     
     # Draw mixture indicators (which component each obs comes from)
     mixture_indicators = np.random.binomial(1, cfg.b2_mixture_weight, size=n)
     
     # Component means (both depend on X, eps)
     # First peak: similar to original sin-based B2
-    mu1 = np.sin(X) + 0.3 * X * eps
+    mu1 = np.sin(X) + 0.3 * X * h_arr
     
     # Second peak: offset version
-    mu2 = np.sin(X + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * X * eps
+    mu2 = np.sin(X + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * X * h_arr
     
     # Component standard deviations (X-dependent heteroskedasticity)
     sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(X))
@@ -160,33 +172,33 @@ def simulate_bimodal_y(cfg: DGPConfig, X: np.ndarray, V_true: np.ndarray, eps: n
     return Y
 
 
-def simulate_first_stage(cfg: DGPConfig, Z: np.ndarray, eta: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    
+def simulate_first_stage(
+    cfg: DGPConfig,
+    Z: np.ndarray,
+    latent_h: np.ndarray,
+    eps_x: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Generate X = G(Z, η) according to first-stage specification.
-    
+    Generate X = G(Z, H, ε_X) according to first-stage specification.
+
+    All first-stage families now share the same latent-factor structure to create
+    endogeneity via the common shock H.
+
     Args:
         cfg: DGP configuration
-        Z: (n,) array of instruments
-        eta: (n,) array of uniform(0,1) quantiles
-    
+        Z: (n,) instrument array
+        latent_h: (n,) latent factor shared with the second stage
+        eps_x: (n,) idiosyncratic shock for X
+
     Returns:
-        X: (n,) array of endogenous regressors
-        V_true: (n,) array of true control function values (= η)
+        X: (n,) endogenous regressor
+        V_true: (n,) oracle control function values (uniform on (0,1))
     """
-
-    mu = mu_of_Z(Z, cfg)
-    sig = sigma_of_Z(Z, cfg)
-    t = mu + sig * norm.ppf(eta)  # location-scale index
-
-    if cfg.first_stage == "A1":
-        X = t
-    elif cfg.first_stage == "A2":
-        X = a2_h_transform(t, cfg)
-    else:
+    if cfg.first_stage not in {"A1", "A2", "A3"}:
         raise ValueError("Unknown first_stage")
 
-    V_true = eta  # oracle control = PIT(η)
+    X = Z + latent_h + eps_x
+    V_true = norm.cdf((X - Z) / np.sqrt(2.0))
     return X, V_true
 
 
@@ -212,15 +224,24 @@ def simulate_second_stage(
     """
     
     if cfg.second_stage == "B1":
+        if latent_h is None:
+            raise ValueError("Second-stage B1 now requires latent_h draws.")
+        h_arr = np.asarray(latent_h, dtype=float)
+        if h_arr.shape != X.shape:
+            raise ValueError("latent_h must have the same shape as X for B1.")
+        eps_arr = np.asarray(eps, dtype=float)
+        if eps_arr.shape != X.shape:
+            raise ValueError("eps must have the same shape as X for B1.")
         m1 = cfg.beta1 * X + cfg.beta2 * (X ** 2)
         sigY = sigmaY_of_X(X, cfg)
-        # Nonzero E[ε|V] under joint normal:  E[ε | V=v] = ρ Φ^{-1}(v)
-        # We simulate Y directly; the conditional mean is handled in m_true().
-        Y = m1 + sigY * eps
+        # Latent H drives endogeneity; eps supplies independent idiosyncratic noise.
+        Y = m1 + sigY * (LATENT_H_WEIGHT * h_arr + eps_arr)
         return Y
     elif cfg.second_stage == "B2":
+        if latent_h is None:
+            raise ValueError("Second-stage B2 now requires latent_h draws.")
         # B2 always uses bimodal mixture of normals
-        return simulate_bimodal_y(cfg, X, V_true, eps)
+        return simulate_bimodal_y(cfg, X, V_true, eps, latent_h)
     elif cfg.second_stage == "B3":
         if latent_h is None:
             raise ValueError("Second-stage B3 requires latent_h draws.")
@@ -264,43 +285,38 @@ def simulate_dataset(cfg: DGPConfig) -> Dict[str, np.ndarray]:
     
     Returns:
         Dictionary containing:
-            - Z: (n,) instrument
+            - Z: (n,) instrument values
             - X: (n,) endogenous regressor
             - Y: (n,) outcome
-            - V_true: (n,) true control function
-            - eps: (n,) error term for Y
-            - eta: (n,) uniform(0,1) quantile for X
+            - V_true: (n,) true control function (≡ η)
+            - eps: (n,) second-stage shock ε_Y
+            - eta: (n,) alias for V_true (kept for backward compatibility)
+            - H: (n,) latent factor shared across stages
+            - eps_x: (n,) first-stage idiosyncratic shock ε_X
+            - eps_y: (n,) copy of ε for convenience when analysing components
     """
     set_seed(cfg.seed)
     n = cfg.n
-    #Z = np.random.randn(n)
     Z = np.random.uniform(0, 3, n)
-    if cfg.first_stage == "A3":
-        if cfg.second_stage not in {"B3", "B4", "B5"}:
-            raise ValueError("First-stage 'A3' currently supports second-stage 'B3', 'B4', or 'B5' only.")
-        latent_h = np.random.randn(n)
-        eps_x = np.random.randn(n)
-        eps_y = np.random.randn(n)
-        X = Z + latent_h + eps_x
-        eta = norm.cdf((X - Z) / np.sqrt(2.0))  # F_{X|Z}(X|Z) under additive normal noise
-        V_true = eta
-        Y = simulate_second_stage(cfg, X, V_true, eps_y, latent_h=latent_h)
-        return {
-            "Z": Z,
-            "X": X,
-            "Y": Y,
-            "V_true": V_true,
-            "eps": eps_y,
-            "eta": eta,
-            "H": latent_h,
-            "eps_x": eps_x,
-            "eps_y": eps_y,
-        }
+    latent_h = np.random.randn(n)
+    eps_x = np.random.randn(n)
+    eps_y = np.random.randn(n)
 
-    eps, eta = simulate_eps_eta(n, cfg.rho)
-    X, V_true = simulate_first_stage(cfg, Z, eta)
-    Y = simulate_second_stage(cfg, X, V_true, eps)
-    return {"Z": Z, "X": X, "Y": Y, "V_true": V_true, "eps": eps, "eta": eta}
+    X, V_true = simulate_first_stage(cfg, Z, latent_h, eps_x)
+    Y = simulate_second_stage(cfg, X, V_true, eps_y, latent_h=latent_h)
+
+    data = {
+        "Z": Z,
+        "X": X,
+        "Y": Y,
+        "V_true": V_true,
+        "eps": eps_y,
+        "eta": V_true,
+        "H": latent_h,
+        "eps_x": eps_x,
+        "eps_y": eps_y,
+    }
+    return data
 
 
 # =========================================================
@@ -472,7 +488,8 @@ def print_data_summary(data: Dict[str, np.ndarray], cfg: DGPConfig, data_type: s
     print("="*60)
     print(f"Sample size: {len(Z)}")
     print(f"DGP configuration: {cfg.first_stage}/{cfg.second_stage}")
-    print(f"Endogeneity correlation ρ: {cfg.rho}")
+    rho_display = "n/a" if cfg.rho is None else f"{cfg.rho}"
+    print(f"Endogeneity correlation ρ: {rho_display}")
     print(f"Random seed: {cfg.seed}")
     
     print(f"\nVariable statistics:")
@@ -495,11 +512,11 @@ if __name__ == "__main__":
     
     # Create configuration for training data
     train_cfg = DGPConfig(
-        n=8000,
+        n=2000,
         seed=123,
         rho=0.6,
-        first_stage="A3",
-        second_stage="B4"
+        first_stage="A1",
+        second_stage="B2"
     )
     
     # Create configuration for test data  
@@ -507,8 +524,8 @@ if __name__ == "__main__":
         n=10000,
         seed=999,
         rho=0.6,
-        first_stage="A3",
-        second_stage="B4"
+        first_stage="A1",
+        second_stage="B2"
     )
     
     print("Configuration:")
