@@ -151,7 +151,6 @@ class FunctionalCurveEngine:
         self.components = prepare_stage2_components(stage2_config)
         self.cdf_model = self.components["cdf_model"]
         self.train_data = self.components["train_data"]
-        self.test_data = self.components.get("test_data")
 
         self.y_support = (
             np.asarray(y_support, dtype=float)
@@ -173,17 +172,13 @@ class FunctionalCurveEngine:
         self, lower_quantile: float = 0.01, upper_quantile: float = 0.99
     ) -> tuple[float, float]:
         """
-        Suggest an x-range based on the observed support in Stage 1/2 data.
+        Suggest an x-range based on the observed support in the training data.
 
-        Quantiles are taken from the combined train/test X samples to avoid
+        Quantiles are taken from the Stage-1 training X samples to avoid
         extrapolation while remaining robust to outliers.
         """
         x_train = np.asarray(self.train_data["X"], dtype=float)
-        data_pieces: List[np.ndarray] = [x_train]
-        if self.test_data is not None and self.test_data.get("X") is not None:
-            data_pieces.append(np.asarray(self.test_data["X"], dtype=float))
-
-        stacked = np.concatenate(data_pieces).astype(float, copy=False)
+        stacked = x_train.astype(float, copy=False)
         lower = float(np.quantile(stacked, lower_quantile))
         upper = float(np.quantile(stacked, upper_quantile))
         if lower >= upper:
@@ -296,11 +291,7 @@ class FunctionalCurveEngine:
             raise ValueError("y_support_points should exceed 10 for stable sampling.")
 
         y_train = np.asarray(self.train_data["Y"], dtype=float)
-        data_pieces: List[np.ndarray] = [y_train]
-        if self.test_data is not None and self.test_data.get("Y") is not None:
-            data_pieces.append(np.asarray(self.test_data["Y"], dtype=float))
-
-        stacked = np.concatenate(data_pieces).astype(float, copy=False)
+        stacked = y_train.astype(float, copy=False)
         y_min = stacked.min()
         y_max = stacked.max()
         span = y_max - y_min
