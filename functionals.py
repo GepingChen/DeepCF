@@ -8,14 +8,72 @@ import pandas as pd
 
 from IV_stage2_9 import (
     Stage2_9Config,
-    prepare_stage2_components,
-    monte_carlo_y_given_x,
+    FullDataStructuralFunctionModel,
+    ConditionalCDFEstimator,
+    sample_tabpfn_y_given_x,
 )
+from IV_stage1_4 import Stage1Config, load_dgp_data, CondCDFModel
 
 try:
     from tabpfn.regressor import TabPFNRegressor
 except Exception:
     from tabpfn import TabPFNRegressor  # type: ignore[import]
+
+
+def _prepare_components_from_train(
+    cfg: Stage2_9Config,
+    stage1_cfg: Stage1Config,
+) -> Dict[str, object]:
+    """
+    Build Stage 2/3 components by computing V_hat from raw training data.
+    """
+    codes = f"{cfg.first_stage_code}_{cfg.second_stage_code}"
+    train_df, _ = load_dgp_data(
+        cfg.first_stage_code,
+        cfg.second_stage_code,
+        train_sample_size=cfg.n_train_samples,
+        base_dir=cfg.dgp_base_dir,
+    )
+
+    observed_train_samples = len(train_df)
+    if cfg.n_train_samples is not None and observed_train_samples != cfg.n_train_samples:
+        raise ValueError(
+            f"Training CSV has {observed_train_samples} rows; expected {cfg.n_train_samples}."
+        )
+
+    Z_train = train_df["Z"].to_numpy(dtype=float)
+    X_train = train_df["X"].to_numpy(dtype=float)
+    Y_train = train_df["Y"].to_numpy(dtype=float)
+
+    stage1_model = CondCDFModel(quantiles=stage1_cfg.quantiles)
+    stage1_model.fit(Z_train, X_train)
+    V_train_hat = stage1_model.predict(Z_train, X_train)
+
+    train_data = {
+        "Z": Z_train,
+        "X": X_train,
+        "Y": Y_train,
+        "V_hat": V_train_hat,
+        "V_true": train_df["V_true"].to_numpy(dtype=float) if "V_true" in train_df else None,
+        "eps": train_df["eps"].to_numpy(dtype=float) if "eps" in train_df else None,
+        "eta": train_df["eta"].to_numpy(dtype=float) if "eta" in train_df else None,
+    }
+
+    m_model = FullDataStructuralFunctionModel(use_tabpfn=cfg.use_tabpfn)
+    _ = m_model.fit_full(train_data["X"], train_data["V_hat"], train_data["Y"])
+
+    cdf_model = ConditionalCDFEstimator(use_tabpfn=cfg.use_tabpfn)
+    _ = cdf_model.fit_full(train_data["X"], train_data["V_hat"], train_data["Y"])
+
+    return {
+        "codes": codes,
+        "train_data": train_data,
+        "train_df": train_df,
+        "m_model": m_model,
+        "cdf_model": cdf_model,
+        "n_train_samples": observed_train_samples,
+        "stage1_model": stage1_model,
+    }
 
 
 @dataclass
@@ -143,12 +201,14 @@ class FunctionalCurveEngine:
         self,
         stage2_config: Stage2_9Config,
         *,
+        stage1_config: Optional[Stage1Config] = None,
         y_support: Optional[np.ndarray] = None,
         y_support_points: int = 401,
         y_support_padding: float = 0.05,
     ) -> None:
         self.cfg = stage2_config
-        self.components = prepare_stage2_components(stage2_config)
+        self.stage1_cfg = stage1_config or Stage1Config()
+        self.components = _prepare_components_from_train(stage2_config, self.stage1_cfg)
         self.cdf_model = self.components["cdf_model"]
         self.train_data = self.components["train_data"]
 
@@ -250,6 +310,7 @@ class FunctionalCurveEngine:
             "mc_samples": mc_samples,
             "seed": seed,
             "stage2_config": self.cfg,
+            "stage1_config": self.stage1_cfg,
             "y_support_min": float(self.y_support.min()),
             "y_support_max": float(self.y_support.max()),
             "y_support_points": int(len(self.y_support)),
@@ -309,13 +370,13 @@ class FunctionalCurveEngine:
         self, x_value: float, n_samples: int, *, rng: np.random.Generator
     ) -> np.ndarray:
         """
-        Sample Y|do(X=x) using the Stage 2 Monte Carlo sampler over noise marginals.
+        Sample Y|do(X=x) using the Stage 2 interventional CDF estimates.
         """
-        dgp_cfg = self.components["dgp_config"]
-        y_samples, _ = monte_carlo_y_given_x(
-            dgp_cfg,
+        y_samples, _, _ = sample_tabpfn_y_given_x(
+            self.cdf_model,
             float(x_value),
             int(n_samples),
+            self.y_support,
             rng,
         )
         return np.asarray(y_samples, dtype=float)
