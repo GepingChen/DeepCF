@@ -512,7 +512,7 @@ if __name__ == "__main__":
     
     # Create configuration for training data
     train_cfg = DGPConfig(
-        n=2000,
+        n=4000,
         seed=123,
         rho=0.6,
         first_stage="A1",
@@ -524,8 +524,8 @@ if __name__ == "__main__":
         n=10000,
         seed=999,
         rho=0.6,
-        first_stage="A1",
-        second_stage="B2"
+        first_stage="A3",
+        second_stage="B1"
     )
     
     print("Configuration:")

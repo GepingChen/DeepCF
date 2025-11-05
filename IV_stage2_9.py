@@ -226,7 +226,7 @@ class Stage2_9Config:
     use_tabpfn: bool = True
 
     # Density diagnostics
-    kde_quantiles: Tuple[float, ...] = (0.25, 0.5, 0.75)
+    kde_quantiles: Tuple[float, ...] = (0.05, 0.25, 0.5, 0.75, 0.95)
     kde_sample_size: int = 1000
 
     # DGP identifiers (for file selection)
@@ -234,7 +234,7 @@ class Stage2_9Config:
     second_stage_code: str = "B1"
 
     # Monte Carlo estimation of y_clean
-    y_clean_mc_samples: int = 100
+    y_clean_mc_samples: int = 5000
 
 
 def prepare_stage2_components(cfg: Stage2_9Config):
@@ -725,7 +725,7 @@ def simulate_y_given_x_eps(cfg: DGPConfig,
         mu2 = np.sin(x_arr + cfg.b2_beta_offset) + cfg.b2_peak_separation + 0.3 * x_arr * h_arr
 
         sigma1 = cfg.b2_sigma1 * (1.0 + 0.2 * np.abs(x_arr))
-        sigma2 = cfg.b2_sigma2 * (1.0 + 0.2 * np.abs(x_arr))
+        sigma2 = cfg.b2_sigma2 * (1.0 + 0.3 * np.abs(x_arr))
 
         y1 = mu1 + sigma1 * rng.standard_normal(n)
         y2 = mu2 + sigma2 * rng.standard_normal(n)
@@ -1205,7 +1205,7 @@ if __name__ == "__main__":
         kde_quantiles=(0.05, 0.25, 0.5, 0.75, 0.95),
         kde_sample_size=1000,
         y_clean_mc_samples=5000,
-        n_train_samples=8000,
+        n_train_samples=500,
     )
 
     print(f"Configuration: {cfg}", flush=True)
