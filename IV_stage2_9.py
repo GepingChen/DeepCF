@@ -806,13 +806,34 @@ def sample_tabpfn_y_given_x(cdf_model: ConditionalCDFEstimator,
         cdf_vals = cdf_vals.reshape(1, -1)
 
     y_samples = np.empty(n_samples, dtype=float)
+    max_rejection_attempts = 1000  # avoid infinite loops if grid support is severely truncated
     for idx in range(n_samples):
         row = np.asarray(cdf_vals[idx], dtype=float)
         row = np.clip(row, 0.0, 1.0)
         row = np.maximum.accumulate(row)
-        row[-1] = 1.0
+        # row[-1] = 1.0  # original behaviour: force remaining tail mass onto the grid endpoint
         row[0] = max(row[0], 0.0)
-        y_samples[idx] = np.interp(u_samples[idx], row, y_support)
+
+        cdf_max = float(row[-1])
+        if cdf_max <= 0.0:
+            raise RuntimeError(
+                "TabPFN CDF returned non-positive mass on supplied support; "
+                "consider expanding y_support before sampling."
+            )
+
+        u_draw = u_samples[idx]
+        if cdf_max < 1.0:
+            attempts = 0
+            while u_draw > cdf_max and attempts < max_rejection_attempts:
+                u_draw = rng.uniform(low=0.0, high=1.0)
+                attempts += 1
+            if attempts >= max_rejection_attempts and u_draw > cdf_max:
+                raise RuntimeError(
+                    "Failed to obtain a CDF-aligned sample after rejection sampling; "
+                    "y_support may exclude too much tail mass."
+                )
+
+        y_samples[idx] = np.interp(u_draw, row, y_support)
 
     return y_samples, v_samples, u_samples
 
@@ -1198,7 +1219,7 @@ if __name__ == "__main__":
         output_dir="IV_datasets/stage2_output",
         random_state=1,
         n_y_grid=100,
-        n_v_integration_points=100,
+        n_v_integration_points=100, #注意：考虑增加到500.（验证是否对速度有较大影响）
         use_tabpfn=True,
         first_stage_code="A3",
         second_stage_code="B4",
